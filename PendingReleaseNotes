@@ -201,6 +201,7 @@
   "repair scrub" would be allowed to start on an OSD that is performing a
   recovery. In this Ceph version, operator-initiated scrubs and repair-scrubs
   are never blocked by a repair being performed.
+* OSD: Ceph now defaults to wpq for osd_op_queue
 
 >=19.2.1
 

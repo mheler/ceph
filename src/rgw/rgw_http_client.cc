@@ -604,6 +604,10 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
       // from being sent. So explicit removal is not needed
       h = curl_slist_append(h, "Expect:");
     }
+    if (method == "PUT") {
+      // Disable Expect: 100-continue for PUT requests
+      h = curl_slist_append(h, "Expect:");
+    }
   }
 
   if (method == "HEAD") {

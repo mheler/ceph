@@ -482,6 +482,41 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_counters_cache
+  type: bool
+  level: advanced
+  desc: Enable per-bucket lifecycle performance counters cache
+  long_desc: When enabled, RGW will create and update per-bucket performance counters
+    for lifecycle operations (expire, transition, abort multipart) and expose them via
+    admin socket perf dump and Prometheus metrics.
+  default: true
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_counters_cache_size
+  type: uint
+  level: advanced
+  desc: Target size for lifecycle counters cache
+  long_desc: Maximum number of per-bucket LC counter entries to maintain in cache
+  default: 10000
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_counters_batch_size
+  type: uint
+  level: advanced
+  desc: Number of LC operations before flushing action counters to cache
+  long_desc: LC action counters (expire, transition, abort_mpu) are accumulated
+    locally and flushed to the performance counters cache after processing.
+    Higher values reduce lock contention and race conditions during metrics
+    export but decrease real-time visibility.
+  default: 5000
+  min: 1
+  services:
+  - rgw
+  see_also:
+  - rgw_lc_counters_cache
+  with_legacy: true
 - name: rgw_restore_debug_interval
   type: int
   level: dev

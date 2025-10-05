@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <tuple>
 #include <functional>
+#include <optional>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string.hpp>
@@ -47,6 +48,97 @@ constexpr int32_t hours_in_a_day = 24;
 constexpr int32_t secs_in_a_day = hours_in_a_day * 60 * 60;
 
 using namespace std;
+
+// Batched LC action counter accumulator
+struct LCBatchCounters {
+  ceph::mutex lock = ceph::make_mutex("LCBatchCounters");
+  std::string bucket_name;
+  uint64_t expire_current = 0;
+  uint64_t expire_noncurrent = 0;
+  uint64_t expire_dm = 0;
+  uint64_t transition_current = 0;
+  uint64_t transition_noncurrent = 0;
+  uint64_t abort_mpu = 0;
+  uint64_t obj_pending_decrements = 0;
+  uint64_t ops_since_flush = 0;
+  uint64_t flush_threshold;
+
+  LCBatchCounters(const std::string& bucket, uint64_t threshold)
+    : bucket_name(bucket), flush_threshold(threshold) {}
+
+  void increment(int counter_idx) {
+    std::lock_guard l(lock);
+    switch (counter_idx) {
+      case l_rgw_lc_per_bucket_expire_current:
+        expire_current++;
+        break;
+      case l_rgw_lc_per_bucket_expire_noncurrent:
+        expire_noncurrent++;
+        break;
+      case l_rgw_lc_per_bucket_expire_dm:
+        expire_dm++;
+        break;
+      case l_rgw_lc_per_bucket_transition_current:
+        transition_current++;
+        break;
+      case l_rgw_lc_per_bucket_transition_noncurrent:
+        transition_noncurrent++;
+        break;
+      case l_rgw_lc_per_bucket_abort_mpu:
+        abort_mpu++;
+        break;
+    }
+    ops_since_flush++;
+    if (flush_threshold > 0 && ops_since_flush >= flush_threshold) {
+      flush_locked();
+    }
+  }
+
+  void decrement(int counter_idx) {
+    std::lock_guard l(lock);
+    if (counter_idx == l_rgw_lc_per_bucket_obj_pending) {
+      obj_pending_decrements++;
+    }
+  }
+
+  void flush() {
+    std::lock_guard l(lock);
+    flush_locked();
+  }
+
+private:
+  void flush_locked() {
+    if (expire_current > 0) {
+      rgw::lc_counters::inc(bucket_name, l_rgw_lc_per_bucket_expire_current, expire_current);
+      expire_current = 0;
+    }
+    if (expire_noncurrent > 0) {
+      rgw::lc_counters::inc(bucket_name, l_rgw_lc_per_bucket_expire_noncurrent, expire_noncurrent);
+      expire_noncurrent = 0;
+    }
+    if (expire_dm > 0) {
+      rgw::lc_counters::inc(bucket_name, l_rgw_lc_per_bucket_expire_dm, expire_dm);
+      expire_dm = 0;
+    }
+    if (transition_current > 0) {
+      rgw::lc_counters::inc(bucket_name, l_rgw_lc_per_bucket_transition_current, transition_current);
+      transition_current = 0;
+    }
+    if (transition_noncurrent > 0) {
+      rgw::lc_counters::inc(bucket_name, l_rgw_lc_per_bucket_transition_noncurrent, transition_noncurrent);
+      transition_noncurrent = 0;
+    }
+    if (abort_mpu > 0) {
+      rgw::lc_counters::inc(bucket_name, l_rgw_lc_per_bucket_abort_mpu, abort_mpu);
+      abort_mpu = 0;
+    }
+    if (obj_pending_decrements > 0) {
+      rgw::lc_counters::dec(bucket_name, l_rgw_lc_per_bucket_obj_pending, obj_pending_decrements);
+      obj_pending_decrements = 0;
+    }
+    ops_since_flush = 0;
+  }
+};
 
 const char* LC_STATUS[] = {
       "UNINITIAL",
@@ -481,6 +573,7 @@ struct lc_op_ctx {
   RGWObjectCtx octx;
   const DoutPrefixProvider *dpp;
   WorkQ* wq;
+  LCBatchCounters* batch_counters;
 
   std::unique_ptr<rgw::sal::PlacementTier> tier;
 
@@ -488,11 +581,12 @@ struct lc_op_ctx {
 	    boost::optional<std::string> next_key_name,
 	    uint64_t num_noncurrent,
 	    ceph::real_time effective_mtime,
-	    const DoutPrefixProvider *dpp, WorkQ* wq)
+	    const DoutPrefixProvider *dpp, WorkQ* wq,
+	    LCBatchCounters* batch_counters)
     : cct(env.driver->ctx()), env(env), o(o), next_key_name(next_key_name),
       num_noncurrent(num_noncurrent), effective_mtime(effective_mtime),
       driver(env.driver), bucket(env.bucket), op(env.op), ol(env.ol),
-      octx(env.driver), dpp(dpp), wq(wq)
+      octx(env.driver), dpp(dpp), wq(wq), batch_counters(batch_counters)
     {
       obj = bucket->get_object(o.key);
       /* once bucket versioning is enabled, the non-current entries with
@@ -728,7 +822,7 @@ public:
   void build();
   void update();
   int process(rgw_bucket_dir_entry& o, const DoutPrefixProvider *dpp,
-	      WorkQ* wq);
+	      WorkQ* wq, LCBatchCounters* batch_counters);
 }; /* LCOpRule */
 
 using WorkItem =
@@ -893,7 +987,8 @@ static inline bool worker_should_stop(time_t stop_at, bool once)
 
 int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
 				       const multimap<string, lc_op>& prefix_map,
-				       LCWorker* worker, time_t stop_at, bool once)
+				       LCWorker* worker, time_t stop_at, bool once,
+				       LCBatchCounters* batch_counters)
 {
   int ret;
   rgw::sal::Bucket::ListParams params;
@@ -907,7 +1002,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
   params.ns = RGW_OBJ_NS_MULTIPART;
   params.access_list_filter = MultipartMetaFilter;
 
-  auto pf = [&](RGWLC::LCWorker *wk, WorkQ *wq, WorkItem &wi) {
+  auto pf = [&, batch_counters](RGWLC::LCWorker *wk, WorkQ *wq, WorkItem &wi) {
     int ret{0};
     auto wt = boost::get<std::tuple<lc_op, rgw_bucket_dir_entry>>(wi);
     auto& [rule, obj] = wt;
@@ -936,6 +1031,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
         if (perfcounter) {
           perfcounter->inc(l_rgw_lc_abort_mpu, 1);
         }
+        batch_counters->increment(l_rgw_lc_per_bucket_abort_mpu);
       } else {
         if (ret == -ERR_NO_SUCH_UPLOAD) {
           ldpp_dout(wk->get_lc(), 5) << "ERROR: abort_multipart_upload "
@@ -1206,6 +1302,7 @@ public:
       if (perfcounter) {
         perfcounter->inc(l_rgw_lc_expire_current, 1);
       }
+      oc.batch_counters->increment(l_rgw_lc_per_bucket_expire_current);
       ldpp_dout(oc.dpp, 2) << "DELETED:" << oc.bucket << ":" << o.key
 		       << " " << oc.wq->thr_name() << dendl;
     }
@@ -1261,6 +1358,7 @@ public:
     if (perfcounter) {
       perfcounter->inc(l_rgw_lc_expire_noncurrent, 1);
     }
+    oc.batch_counters->increment(l_rgw_lc_per_bucket_expire_noncurrent);
     ldpp_dout(oc.dpp, 2) << "DELETED:" << oc.bucket << ":" << o.key
 		     << " (non-current expiration) "
 		     << oc.wq->thr_name() << dendl;
@@ -1308,6 +1406,7 @@ public:
     if (perfcounter) {
       perfcounter->inc(l_rgw_lc_expire_dm, 1);
     }
+    oc.batch_counters->increment(l_rgw_lc_per_bucket_expire_dm);
     ldpp_dout(oc.dpp, 2) << "DELETED:" << oc.bucket << ":" << o.key
 		     << " (delete marker expiration) "
 		     << oc.wq->thr_name() << dendl;
@@ -1591,6 +1690,7 @@ public:
         if (perfcounter) {
           perfcounter->inc(l_rgw_lc_transition_current, 1);
         }
+        oc.batch_counters->increment(l_rgw_lc_per_bucket_transition_current);
       }
       return r;
     }
@@ -1616,6 +1716,7 @@ public:
         if (perfcounter) {
           perfcounter->inc(l_rgw_lc_transition_noncurrent, 1);
         }
+        oc.batch_counters->increment(l_rgw_lc_per_bucket_transition_noncurrent);
       }
       return r;
     }
@@ -1658,9 +1759,9 @@ void LCOpRule::update()
 
 int LCOpRule::process(rgw_bucket_dir_entry& o,
 		      const DoutPrefixProvider *dpp,
-		      WorkQ* wq)
+		      WorkQ* wq, LCBatchCounters* batch_counters)
 {
-  lc_op_ctx ctx(env, o, next_key_name, num_noncurrent, effective_mtime, dpp, wq);
+  lc_op_ctx ctx(env, o, next_key_name, num_noncurrent, effective_mtime, dpp, wq, batch_counters);
   shared_ptr<LCOpAction> *selected = nullptr; // n.b., req'd by sharing
   real_time exp;
 
@@ -1780,7 +1881,23 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   /* fetch information for zone checks */
   rgw::sal::Zone* zone = driver->get_zone();
 
-  auto pf = [&bucket_name](RGWLC::LCWorker* wk, WorkQ* wq, WorkItem& wi) {
+  // Reset LC counters at START of bucket processing
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_expire_current, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_expire_noncurrent, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_expire_dm, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_transition_current, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_transition_noncurrent, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_abort_mpu, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_obj_total, 0);
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_obj_pending, 0);
+
+  uint64_t total_objects_processed = 0;
+
+  // Create batched counter accumulator
+  uint64_t batch_threshold = cct->_conf->rgw_lc_counters_batch_size;
+  LCBatchCounters batch_counters(bucket->get_name(), batch_threshold);
+
+  auto pf = [&bucket_name, &batch_counters](RGWLC::LCWorker* wk, WorkQ* wq, WorkItem& wi) {
     auto wt =
       boost::get<std::tuple<LCOpRule, rgw_bucket_dir_entry>>(wi);
     auto& [op_rule, o] = wt;
@@ -1788,7 +1905,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     ldpp_dout(wk->get_lc(), 20)
       << __func__ << "(): key=" << o.key << wq->thr_name() 
       << dendl;
-    int ret = op_rule.process(o, wk->dpp, wq);
+    int ret = op_rule.process(o, wk->dpp, wq, &batch_counters);
     if (ret < 0) {
       ldpp_dout(wk->get_lc(), 20)
 	<< "ERROR: orule.process() returned ret=" << ret
@@ -1796,6 +1913,8 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
 	<< " bucket=" << bucket_name
 	<< dendl;
     }
+    // Decrement pending counter after processing each object
+    batch_counters.decrement(l_rgw_lc_per_bucket_obj_pending);
   };
   worker->workpool->setf(pf);
 
@@ -1855,6 +1974,11 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       orule.update();
       std::tuple<LCOpRule, rgw_bucket_dir_entry> t1 = {orule, *o};
       worker->workpool->enqueue(WorkItem{t1});
+      total_objects_processed++;
+
+      // Update obj_pending after each object is enqueued (before processing starts)
+      rgw::lc_counters::inc(bucket->get_name(), l_rgw_lc_per_bucket_obj_pending, 1);
+
       if ((offset % 100) == 0) {
 	if (worker_should_stop(stop_at, once)) {
 	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker="
@@ -1867,7 +1991,20 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     worker->workpool->drain();
   }
 
-  ret = handle_multipart_expiration(bucket.get(), prefix_map, worker, stop_at, once);
+  // Set objects_total to show total objects enumerated
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_obj_total, total_objects_processed);
+
+  // Flush any remaining batched counters after workpool drains
+  batch_counters.flush();
+
+  ret = handle_multipart_expiration(bucket.get(), prefix_map, worker, stop_at, once, &batch_counters);
+
+  // Flush again after multipart expiration
+  batch_counters.flush();
+
+  // Update LC timestamp at END of bucket processing (Unix epoch seconds)
+  rgw::lc_counters::set(bucket->get_name(), l_rgw_lc_per_bucket_last_proc, ceph_clock_now().sec());
+
   return ret;
 }
 

@@ -7,6 +7,7 @@
 #include <array>
 #include <string>
 #include <iostream>
+#include <optional>
 
 #include "common/debug.h"
 
@@ -30,6 +31,9 @@ static std::string lc_oid_prefix = "lc";
 static std::string lc_index_lock_name = "lc_process";
 
 extern const char* LC_STATUS[];
+
+// Forward declaration
+struct LCBatchCounters;
 
 typedef enum {
   lc_uninitial = 0,
@@ -673,7 +677,8 @@ public:
 
   int handle_multipart_expiration(rgw::sal::Bucket* target,
 				  const std::multimap<std::string, lc_op>& prefix_map,
-				  LCWorker* worker, time_t stop_at, bool once);
+				  LCWorker* worker, time_t stop_at, bool once,
+				  LCBatchCounters* batch_counters);
 };
 
 namespace rgw::lc {

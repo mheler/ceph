@@ -3596,6 +3596,7 @@ int RadosObject::RadosDeleteOp::delete_obj(const DoutPrefixProvider* dpp, option
   parent_op.params.size_match = params.size_match;
   parent_op.params.if_match = params.if_match;
   parent_op.params.high_precision_time = params.high_precision_time;
+  parent_op.params.defer_gc = params.defer_gc;
   parent_op.params.zones_trace = params.zones_trace;
   parent_op.params.abortmp = params.abortmp;
   parent_op.params.parts_accounted_size = params.parts_accounted_size;
@@ -3781,7 +3782,7 @@ int RadosMultipartUpload::cleanup_orphaned_parts(const DoutPrefixProvider *dpp,
     store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id(), y);
   } else {
     /* use upload id as tag and do it synchronously */
-    auto [ret, leftover_chain] = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id(), y);
+    auto [ret, leftover_chain] = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id(), std::string{}, y);
     if (ret < 0 && leftover_chain) {
       ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
       if (ret == -ENOENT) {
@@ -3828,7 +3829,7 @@ int RadosMultipartUpload::cleanup_part_history(const DoutPrefixProvider* dpp,
     store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id(), y);
   } else {
     // use upload id as tag and do it synchronously
-    auto [ret, leftover_chain] = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id(), y);
+    auto [ret, leftover_chain] = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id(), std::string{}, y);
     if (ret < 0 && leftover_chain) {
       ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
       if (ret == -ENOENT) {
@@ -3918,7 +3919,7 @@ int RadosMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
       store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id(), y);
     } else {
       /* use upload id as tag and do it synchronously */
-      auto [ret, leftover_chain] = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id(), y);
+      auto [ret, leftover_chain] = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id(), std::string{}, y);
       if (ret < 0 && leftover_chain) {
         ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
         if (ret == -ENOENT) {

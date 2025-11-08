@@ -429,7 +429,8 @@ class RGWRados
   int get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                          RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          RGWObjStateManifest** psm, bool follow_olh,
-                         optional_yield y, bool assume_noent = false);
+                         optional_yield y, bool assume_noent = false,
+                         bool treat_lc_defer_as_deleted = true);
   int append_atomic_test(const DoutPrefixProvider *dpp, RGWObjectCtx* rctx, RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          librados::ObjectOperation& op, RGWObjState **state,
 			 RGWObjManifest** pmanifest, optional_yield y);
@@ -714,7 +715,7 @@ public:
     const rgw_placement_rule *pmeta_placement_rule;
 
   protected:
-    int get_state(const DoutPrefixProvider *dpp, RGWObjState **pstate, RGWObjManifest **pmanifest, bool follow_olh, optional_yield y, bool assume_noent = false);
+    int get_state(const DoutPrefixProvider *dpp, RGWObjState **pstate, RGWObjManifest **pmanifest, bool follow_olh, optional_yield y, bool assume_noent = false, bool treat_lc_defer_as_deleted = true);
     void invalidate_state();
 
     int get_current_version_state(const DoutPrefixProvider *dpp, RGWObjState*& current_state, optional_yield y);
@@ -890,8 +891,9 @@ public:
 	bool abortmp;
 	uint64_t parts_accounted_size;
 	obj_version *check_objv;
+        bool defer_gc{false};
 
-        DeleteParams() : versioning_status(0), null_verid(false), olh_epoch(0), bilog_flags(0), remove_objs(NULL), high_precision_time(false), zones_trace(nullptr), abortmp(false), parts_accounted_size(0), check_objv(nullptr) {}
+        DeleteParams() : versioning_status(0), null_verid(false), olh_epoch(0), bilog_flags(0), remove_objs(NULL), high_precision_time(false), zones_trace(nullptr), abortmp(false), parts_accounted_size(0), check_objv(nullptr), defer_gc(false) {}
       } params;
 
       struct DeleteResult {
@@ -1333,6 +1335,18 @@ int restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
                  const bool force = false, // if head object missing, do a best effort
                  const bool skip_olh_obj_update = false); // true for all deletes (except the last one) initiated by a multi-object delete op
 
+  struct DeferredDelete {
+    cls_rgw_obj_chain chain;
+    std::string tag;
+    std::string head_id_tag;
+    bool active = false;
+
+    int prepare(RGWRados* store, const DoutPrefixProvider* dpp,
+                const RGWBucketInfo& bucket_info, const rgw_obj& obj,
+                RGWObjState* state, RGWObjManifest* manifest, optional_yield y);
+    int commit(RGWRados* store, const DoutPrefixProvider* dpp, optional_yield y);
+    void cancel();
+  };
   int delete_raw_obj(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, optional_yield y);
 
   /** Remove an object from the bucket index */
@@ -1359,13 +1373,15 @@ int restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
   int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                     RGWBucketInfo& bucket_info, const rgw_obj& obj,
                     RGWObjStateManifest** psm, bool follow_olh,
-                    optional_yield y, bool assume_noent = false);
+                    optional_yield y, bool assume_noent = false,
+                    bool treat_lc_defer_as_deleted = true);
 
   int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx,
                     RGWBucketInfo& bucket_info, const rgw_obj& obj,
                     RGWObjState** pstate, RGWObjManifest** pmanifest,
                     bool follow_olh, optional_yield y,
-                    bool assume_noent = false);
+                    bool assume_noent = false,
+                    bool treat_lc_defer_as_deleted = true);
 
   using iterate_obj_cb = int (*)(const DoutPrefixProvider*, const rgw_raw_obj&, off_t, off_t,
                                  off_t, bool, RGWObjState*, void*);
@@ -1623,7 +1639,10 @@ public:
   int unlock(const rgw_pool& pool, const std::string& oid, rgw_zone_id& zone_id, std::string& owner_id);
 
   void update_gc_chain(const DoutPrefixProvider *dpp, rgw_obj head_obj, RGWObjManifest& manifest, cls_rgw_obj_chain *chain);
-  std::tuple<int, std::optional<cls_rgw_obj_chain>> send_chain_to_gc(cls_rgw_obj_chain& chain, const std::string& tag, optional_yield y);
+  std::tuple<int, std::optional<cls_rgw_obj_chain>> send_chain_to_gc(cls_rgw_obj_chain& chain,
+                                                                     const std::string& tag,
+                                                                     const std::string& head_id_tag,
+                                                                     optional_yield y);
   void delete_objs_inline(const DoutPrefixProvider *dpp, cls_rgw_obj_chain& chain,
                           const std::string& tag, optional_yield y);
   int gc_operate(const DoutPrefixProvider *dpp, std::string& oid, librados::ObjectWriteOperation&& op, optional_yield y);

@@ -1269,22 +1269,27 @@ struct cls_rgw_gc_obj_info
   std::string tag;
   cls_rgw_obj_chain chain;
   ceph::real_time time;
+  std::string head_id_tag;
 
   cls_rgw_gc_obj_info() {}
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(tag, bl);
     encode(chain, bl);
     encode(time, bl);
+    encode(head_id_tag, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(tag, bl);
     decode(chain, bl);
     decode(time, bl);
+    if (struct_v >= 2) {
+      decode(head_id_tag, bl);
+    }
     DECODE_FINISH(bl);
   }
 
@@ -1294,6 +1299,7 @@ struct cls_rgw_gc_obj_info
     chain.dump(f);
     f->close_section();
     f->dump_stream("time") << time;
+    f->dump_string("head_id_tag", head_id_tag);
   }
   static void generate_test_instances(std::list<cls_rgw_gc_obj_info*>& ls) {
     ls.push_back(new cls_rgw_gc_obj_info);
@@ -1301,6 +1307,7 @@ struct cls_rgw_gc_obj_info
     ls.back()->tag = "footag";
     ceph_timespec ts{ceph_le32(21), ceph_le32(32)};
     ls.back()->time = ceph::real_clock::from_ceph_timespec(ts);
+    ls.back()->head_id_tag = "sample_id";
   }
 
   size_t estimate_encoded_size() const {
@@ -1308,7 +1315,7 @@ struct cls_rgw_gc_obj_info
     constexpr size_t string_overhead = sizeof(__u32); // strings are encoded with 32-bit length prefix
     constexpr size_t time_overhead = 2 * sizeof(ceph_le32); // time is stored as tv_sec and tv_nsec
     return start_overhead + string_overhead + tag.size() +
-            time_overhead + chain.estimate_encoded_size();
+            time_overhead + chain.estimate_encoded_size() + string_overhead + head_id_tag.size();
   }
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_obj_info)

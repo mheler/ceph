@@ -505,6 +505,19 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_defer_delete
+  type: bool
+  level: advanced
+  desc: Defer LC object deletion to GC for improved performance
+  long_desc: When enabled, lifecycle removes the bucket index entry immediately but
+    queues the object data to RGW GC for asynchronous deletion. Use this only when GC
+    threads are enabled and sized appropriately; if GC is unavailable the delete falls
+    back to the synchronous path. Objects become immediately inaccessible via S3 once
+    the index entry is removed.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_restore_debug_interval
   type: int
   level: dev

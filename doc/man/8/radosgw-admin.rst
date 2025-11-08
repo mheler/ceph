@@ -379,6 +379,14 @@ as follows:
   --bucket_id or via --bucket and optional --tenant), only that bucket
   is processed.
 
+:command:`lc defer-cleanup`
+  Recovery tool to reprocess lifecycle deferred deletes for a specific bucket
+  (requires ``--bucket``, optional ``--dry-run``). It scans the bucket index for
+  pending entries whose head object still carries the internal lifecycle marker
+  and replays the delete (queueing to GC or deleting inline if GC is unavailable).
+  Normally GC should drain the queue; use this when
+  you want to clean a single bucket without running the full GC queue.
+
 :command:`metadata get`
   Get metadata info.
 

@@ -15,6 +15,7 @@
 #include "cls/lock/cls_lock_client.h"
 #include "include/random.h"
 #include "rgw_gc_log.h"
+#include "rgw_lc.h"
 
 #include <list> // XXX
 #include <sstream>
@@ -66,10 +67,19 @@ int RGWGC::tag_index(const string& tag)
   return rgw_shards_mod(XXH64(tag.c_str(), tag.size(), seed), max_objs);
 }
 
-std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const cls_rgw_obj_chain& chain, const std::string& tag, optional_yield y)
+std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const cls_rgw_obj_chain& chain, const std::string& tag, const std::string& head_id_tag, optional_yield y)
 {
   ldpp_dout(this, 20) << "RGWGC::send_split_chain - tag is: " << tag << dendl;
 
+  std::string pending_head_tag = head_id_tag;
+  auto next_head_tag = [&]() {
+    if (!pending_head_tag.empty()) {
+      std::string out = pending_head_tag;
+      pending_head_tag.clear();
+      return out;
+    }
+    return std::string{};
+  };
   if (cct->_conf->rgw_max_chunk_size) {
     cls_rgw_obj_chain broken_chain;
     cls_rgw_gc_set_entry_op op;
@@ -90,7 +100,7 @@ std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const 
         broken_chain.objs.pop_back();
         --it;
         ldpp_dout(this, 20) << "RGWGC::send_split_chain - more than, dont add to broken chain and send chain" << dendl;
-        auto ret = send_chain(broken_chain, tag, y);
+        auto ret = send_chain(broken_chain, tag, next_head_tag(), y);
         if (ret < 0) {
           broken_chain.objs.insert(broken_chain.objs.end(), it, chain.objs.end()); // add all the remainder objs to the list to be deleted inline
           ldpp_dout(this, 0) << "RGWGC::send_split_chain - send chain returned error: " << ret << dendl;
@@ -102,14 +112,14 @@ std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const 
     }
     if (!broken_chain.objs.empty()) { //when the chain is smaller than or equal to rgw_max_chunk_size
       ldpp_dout(this, 20) << "RGWGC::send_split_chain - sending leftover objects" << dendl;
-      auto ret = send_chain(broken_chain, tag, y);
+      auto ret = send_chain(broken_chain, tag, next_head_tag(), y);
       if (ret < 0) {
         ldpp_dout(this, 0) << "RGWGC::send_split_chain - send chain returned error: " << ret << dendl;
         return {ret, {broken_chain}};
       }
     }
   } else {
-    auto ret = send_chain(chain, tag, y);
+    auto ret = send_chain(chain, tag, next_head_tag(), y);
     if (ret < 0) {
       ldpp_dout(this, 0) << "RGWGC::send_split_chain - send chain returned error: " << ret << dendl;
       return {ret, {std::move(chain)}};
@@ -118,12 +128,13 @@ std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const 
   return {0, {}};
 }
 
-int RGWGC::send_chain(const cls_rgw_obj_chain& chain, const string& tag, optional_yield y)
+int RGWGC::send_chain(const cls_rgw_obj_chain& chain, const string& tag, const string& head_id_tag, optional_yield y)
 {
   ObjectWriteOperation op;
   cls_rgw_gc_obj_info info;
   info.chain = chain;
   info.tag = tag;
+  info.head_id_tag = head_id_tag;
   gc_log_enqueue2(op, cct->_conf->rgw_gc_obj_min_wait, info);
 
   int i = tag_index(tag);
@@ -367,6 +378,7 @@ class RGWGCIOManager {
     string oid;
     int index{-1};
     string tag;
+    bool guarded_head{false};
   };
 
   deque<IO> ios;
@@ -395,7 +407,7 @@ public:
   }
 
   int schedule_io(IoCtx *ioctx, const string& oid, ObjectWriteOperation *op,
-		  int index, const string& tag) {
+		  int index, const string& tag, bool guarded_head = false) {
     while (ios.size() > max_aio) {
       if (gc->going_down()) {
         return 0;
@@ -412,7 +424,7 @@ public:
     if (ret < 0) {
       return ret;
     }
-    ios.push_back(IO{IO::TailIO, c.get(), oid, index, tag});
+    ios.push_back(IO{IO::TailIO, c.get(), oid, index, tag, guarded_head});
     c.release();
 
     return 0;
@@ -424,6 +436,14 @@ public:
     io.c->wait_for_complete();
     int ret = io.c->get_return_value();
     io.c->release();
+
+    if (ret < 0 && io.guarded_head) {
+      if (ret == -ECANCELED || ret == -ENODATA) {
+        ldpp_dout(dpp, 10) << "GC skipped deferred head " << io.oid
+                           << " because write tag changed" << dendl;
+        ret = 0;
+      }
+    }
 
     if (ret == -ENOENT) {
       ret = 0;
@@ -668,6 +688,8 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
         }
       }
       if (! chain.objs.empty()) {
+        const bool guarding_head = !info.head_id_tag.empty();
+        size_t chain_index = 0;
 	for (const auto& obj : chain.objs) {
 	  if (obj.pool != last_pool) {
 	    delete ctx;
@@ -693,9 +715,15 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
 	  ldpp_dout(this, 5) << "RGWGC::process removing " << obj.pool <<
 	    ":" << obj.key.name << dendl;
 	  ObjectWriteOperation op;
+          if (guarding_head && chain_index == 0) {
+            bufferlist expected;
+            expected.append(info.head_id_tag.c_str(), info.head_id_tag.size() + 1);
+            op.cmpxattr(RGW_ATTR_ID_TAG, CEPH_OSD_CMPXATTR_OP_EQ, expected);
+          }
 	  cls_refcount_put(op, info.tag, true);
 
-	  ret = io_manager.schedule_io(ctx, oid, &op, index, info.tag);
+          ret = io_manager.schedule_io(ctx, oid, &op, index, info.tag,
+                                       guarding_head && chain_index == 0);
 	  if (ret < 0) {
 	    ldpp_dout(this, 0) <<
 	      "WARNING: failed to schedule deletion for oid=" << oid << dendl;
@@ -709,6 +737,7 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
 	    // will be picked up next time around
 	    goto done;
 	  }
+          ++chain_index;
 	} // chains loop
       } // else -- chains not empty
     } // entries loop

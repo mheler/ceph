@@ -510,6 +510,9 @@ struct lc_op_ctx {
 
   std::unique_ptr<rgw::sal::PlacementTier> tier;
 
+  // Deferred deletion support
+  bool defer_delete_enabled{false};
+
   lc_op_ctx(op_env& env, rgw_bucket_dir_entry& o,
 	    boost::optional<std::string> next_key_name,
 	    uint64_t num_noncurrent,
@@ -680,8 +683,12 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   del_op->params.obj_owner.display_name = meta.owner_display_name;
   del_op->params.bucket_owner = bucket_info.owner;
   del_op->params.unmod_since = meta.mtime;
+  const bool zonegroup_ok = zonegroup_lc_check(dpp, oc.driver->get_zone());
+  if (oc.defer_delete_enabled && remove_indeed && zonegroup_ok) {
+    del_op->params.defer_gc = true;
+  }
 
-  uint32_t flags = (!remove_indeed || !zonegroup_lc_check(dpp, oc.driver->get_zone()))
+  uint32_t flags = (!remove_indeed || !zonegroup_ok)
                    ? rgw::sal::FLAG_LOG_OP : 0;
   ret =  del_op->delete_obj(dpp, y, flags);
   if (ret < 0) {
@@ -1525,6 +1532,10 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
 		      optional_yield y)
 {
   lc_op_ctx ctx(env, o, next_key_name, num_noncurrent, effective_mtime, dpp);
+
+  // Initialize deferred deletion settings
+  ctx.defer_delete_enabled = ctx.cct->_conf->rgw_lc_defer_delete;
+
   shared_ptr<LCOpAction> *selected = nullptr; // n.b., req'd by sharing
   real_time exp;
 
@@ -2938,6 +2949,7 @@ void lc_op::dump(Formatter *f) const
   f->close_section();
 }
 
+
 void LCFilter::dump(Formatter *f) const
 {
   f->dump_string("prefix", prefix);
@@ -3005,4 +3017,3 @@ void RGWLifecycleConfiguration::dump(Formatter *f) const
   }
   f->close_section();
 }
-

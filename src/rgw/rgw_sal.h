@@ -1170,6 +1170,7 @@ class Object {
 	bool abortmp{false};
 	uint64_t parts_accounted_size{0};
         RGWObjVersionTracker* objv_tracker = nullptr;
+        bool defer_gc{false};
       } params;
 
       struct Result {

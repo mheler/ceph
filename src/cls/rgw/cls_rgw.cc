@@ -1290,8 +1290,9 @@ int rgw_bucket_complete_op(cls_method_context_t hctx, bufferlist *in, bufferlist
       log_op = false;
     } else if (!entry.pending_map.size()) {
 	CLS_LOG_BITX(bitx_inst, 20,
-		     "INFO: %s: removing map entry with key=%s",
-		     __func__, escape_str(idx).c_str());
+		     "INFO: %s: removing map entry%s with key=%s",
+		     __func__, (op.bilog_flags & RGW_BILOG_FLAG_DEFERRED_DELETE) ? " (deferred delete)" : "",
+		     escape_str(idx).c_str());
       rc = remove_entry(hctx, idx, entry.key, header);
       if (rc < 0) {
 	  CLS_LOG_BITX(bitx_inst, 1,

@@ -92,6 +92,37 @@ daemon for each zone.
 
 .. confval:: rgw_enable_lc_threads
 
+To decouple lifecycle cleanup from the foreground delete path you can defer
+object removal to the garbage collector:
+
+.. confval:: rgw_lc_defer_delete
+
+   Lifecycle already routes stripe “tail” objects (for multipart/object chunk
+   data) through the RGW GC.  When this option is ``true`` (default ``false``)
+   the object *head* follows the same path: lifecycle removes the bucket index
+   entry immediately but queues the data to GC instead of deleting inline.
+   The object head is stamped with an internal lifecycle marker so GET/HEAD requests fail
+   immediately until GC removes the data.  If GC is unavailable the delete
+   falls back to the synchronous path, so there is no durability penalty beyond
+   the time it takes GC workers to drain the queue.
+
+   When enabled, the following lifecycle perf counters track the workflow:
+
+   ``lc_defer_attempt`` – number of head deletes lifecycle attempted to defer.
+
+   ``lc_defer_queued`` – number of chains successfully queued to GC.
+
+   ``lc_defer_inline`` – number of head deletes that fell back to inline cleanup
+   because GC was unavailable or enqueue failed.
+
+.. warning::
+
+   Enabling ``rgw_lc_defer_delete`` requires ``rgw_enable_gc_threads`` to be
+   enabled and the GC thread count sized for your workload. Monitor GC queue
+   depth to ensure deferred deletes are processed in a timely manner. Consider
+   tuning ``rgw_gc_max_concurrent_io`` and ``rgw_gc_max_trim_chunk`` so the GC
+   threads process objects faster than lifecycle enqueues them.
+
 Garbage Collection Settings
 ===========================
 

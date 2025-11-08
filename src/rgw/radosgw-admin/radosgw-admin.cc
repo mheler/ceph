@@ -7,6 +7,7 @@
 
 #include <cerrno>
 #include <string>
+#include <string_view>
 #include <sstream>
 #include <optional>
 #include <iostream>
@@ -61,6 +62,7 @@ extern "C" {
 #include "rgw_lc.h"
 #include "rgw_log.h"
 #include "rgw_formats.h"
+#include "rgw_common.h"
 #include "rgw_usage.h"
 #include "rgw_sync.h"
 #include "rgw_trim_bilog.h"
@@ -292,6 +294,7 @@ void usage()
   cout << "  lc get                           get a lifecycle bucket configuration\n";
   cout << "  lc process                       manually process lifecycle\n";
   cout << "  lc reshard fix                   fix LC for a resharded bucket\n";
+  cout << "  lc defer-cleanup                 remove stuck lifecycle deferred deletes from a bucket index\n";
   cout << "  metadata get                     get metadata info\n";
   cout << "  metadata put                     put metadata info\n";
   cout << "  metadata rm                      remove metadata info\n";
@@ -400,6 +403,7 @@ void usage()
   cout << "   --end-date=<date>                 end date in the format yyyy-mm-dd\n";
   cout << "   --bucket-id=<bucket-id>           bucket id\n";
   cout << "   --bucket-new-name=<bucket>        for bucket link: optional new name\n";
+  cout << "   --dry-run                         lifecycle defer-cleanup: report matches without modifying indexes\n";
   cout << "   --count=<count>                   optional for:\n";
   cout << "                                       datalog semaphore reset\n";
   cout << "   --shard-id=<shard-id>             optional for:\n";
@@ -777,6 +781,7 @@ enum class OPT {
   LC_GET,
   LC_PROCESS,
   LC_RESHARD_FIX,
+  LC_DEFER_CLEANUP,
   ORPHANS_FIND,
   ORPHANS_FINISH,
   ORPHANS_LIST_JOBS,
@@ -1034,6 +1039,7 @@ static SimpleCmd::Commands all_cmds = {
   { "lc get", OPT::LC_GET },
   { "lc process", OPT::LC_PROCESS },
   { "lc reshard fix", OPT::LC_RESHARD_FIX },
+  { "lc defer-cleanup", OPT::LC_DEFER_CLEANUP },
   { "orphans find", OPT::ORPHANS_FIND },
   { "orphans finish", OPT::ORPHANS_FINISH },
   { "orphans list jobs", OPT::ORPHANS_LIST_JOBS },
@@ -3716,6 +3722,7 @@ int main(int argc, const char **argv)
   int placement_inline_data = true;
   bool placement_inline_data_specified = false;
   bool format_arg_passed = false;
+  bool lc_defer_dry_run = false;
 
   int64_t max_objects = -1;
   int64_t max_size = -1;
@@ -9500,6 +9507,156 @@ next:
       cerr << "ERROR: fixing lc shards: " << cpp_strerror(-ret) << std::endl;
     }
 
+  }
+
+  if (opt_cmd == OPT::LC_DEFER_CLEANUP) {
+    if (bucket_name.empty()) {
+      cerr << "ERROR: bucket name was not provided (via --bucket)" << std::endl;
+      return EINVAL;
+    }
+
+    auto local_args = args; // copy for command-specific parsing
+    for (auto ai = local_args.begin(); ai != local_args.end(); ) {
+      if (ceph_argparse_flag(local_args, ai, "--dry-run", (char*)NULL)) {
+        lc_defer_dry_run = true;
+      } else {
+        ++ai;
+      }
+    }
+
+    int ret = init_bucket(tenant, bucket_name, bucket_id, &bucket);
+    if (ret < 0) {
+      cerr << "ERROR: could not init bucket: " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+
+    auto* rados_store = dynamic_cast<rgw::sal::RadosStore*>(driver);
+    if (!rados_store) {
+      cerr << "ERROR: lc defer-cleanup is only supported on the rados backend" << std::endl;
+      return -EOPNOTSUPP;
+    }
+    RGWRados* rados = rados_store->getRados();
+
+
+    const auto& index = bucket->get_info().layout.current_index;
+    if (index.layout.type == rgw::BucketIndexType::Indexless) {
+      cerr << "ERROR: lifecycle defer-cleanup is not supported for indexless buckets" << std::endl;
+      return EINVAL;
+    }
+
+    const int max_shards = rgw::num_shards(index);
+    if (specified_shard_id &&
+        (shard_id < 0 || shard_id >= max_shards)) {
+      cerr << "ERROR: shard-id is out of range for this bucket" << std::endl;
+      return EINVAL;
+    }
+
+    uint64_t scanned = 0;
+    uint64_t matched = 0;
+    uint64_t cleaned = 0;
+    uint64_t failures = 0;
+
+    constexpr uint32_t LC_DEFER_DEFAULT_BATCH = 1000;
+    const uint32_t list_batch =
+        (max_entries_specified && max_entries > 0) ? static_cast<uint32_t>(max_entries)
+                                                   : LC_DEFER_DEFAULT_BATCH;
+    const int start_shard = specified_shard_id ? shard_id : 0;
+    const int end_shard = specified_shard_id ? shard_id + 1 : max_shards;
+
+    for (int shard = start_shard; shard < end_shard; ++shard) {
+      RGWRados::BucketShard bs(rados);
+      ret = bs.init(dpp(), bucket->get_info(), index, shard, null_yield);
+      if (ret < 0) {
+        cerr << "ERROR: failed to init shard " << shard
+             << ": " << cpp_strerror(-ret) << std::endl;
+        return -ret;
+      }
+
+      std::string marker;
+      bool is_truncated = true;
+      std::list<rgw_cls_bi_entry> entries;
+
+      do {
+        entries.clear();
+        ret = rados->bi_list(bs, "", marker, list_batch, &entries,
+                             &is_truncated, false, null_yield);
+        if (ret < 0) {
+          cerr << "ERROR: bi_list() failed on shard " << shard
+               << ": " << cpp_strerror(-ret) << std::endl;
+          return -ret;
+        }
+
+        for (auto& bi_entry : entries) {
+          marker = bi_entry.idx;
+          if (bi_entry.type != BIIndexType::Plain) {
+            continue;
+          }
+
+          rgw_bucket_dir_entry dirent;
+          auto diter = bi_entry.data.cbegin();
+          try {
+            decode(dirent, diter);
+          } catch (const buffer::error&) {
+            ++failures;
+            continue;
+          }
+
+          ++scanned;
+
+          if (dirent.exists ||
+              dirent.ver.pool != -1 || dirent.ver.epoch != 0 ||
+              dirent.pending_map.size() != 1) {
+            continue;
+          }
+
+          const std::string& pending_tag = dirent.pending_map.begin()->first;
+          if (pending_tag.empty()) {
+            continue;
+          }
+
+          rgw_obj obj(bucket->get_key(), dirent.key);
+          ++matched;
+
+          if (!lc_defer_dry_run) {
+            rgw_bucket_dir_entry ent = dirent;
+
+            int recover_ret = rados->recover_deferred_delete(dpp(), bucket->get_info(), obj,
+                                                             null_yield);
+            if (recover_ret < 0 && recover_ret != -ENOENT) {
+              cerr << "ERROR: failed to recover deferred delete for '" << dirent.key.name
+                   << "' on shard " << shard << ": " << cpp_strerror(-recover_ret) << std::endl;
+              ++failures;
+              continue;
+            }
+
+            std::string tag_copy = pending_tag;
+            int complete_ret = rados->cls_obj_complete_op(bs, obj, CLS_RGW_OP_DEL,
+                                                          tag_copy, -1, 0, ent,
+                                                          RGWObjCategory::None, nullptr,
+                                                          0, nullptr, false);
+            if (complete_ret < 0) {
+              cerr << "ERROR: failed to drop pending entry '" << dirent.key.name
+                   << "' on shard " << shard << ": " << cpp_strerror(-complete_ret) << std::endl;
+              ++failures;
+              continue;
+            }
+          }
+
+          ++cleaned;
+        }
+      } while (is_truncated);
+    }
+
+    formatter->open_object_section("lc_defer_cleanup");
+    formatter->dump_string("bucket", bucket->get_name());
+    formatter->dump_unsigned("shards", max_shards);
+    formatter->dump_unsigned("scanned", scanned);
+    formatter->dump_unsigned("matched", matched);
+    formatter->dump_unsigned(lc_defer_dry_run ? "would_clean" : "cleaned", cleaned);
+    formatter->dump_unsigned("errors", failures);
+    formatter->dump_bool("dry_run", lc_defer_dry_run);
+    formatter->close_section();
+    formatter->flush(cout);
   }
 
   if (opt_cmd == OPT::ORPHANS_FIND) {

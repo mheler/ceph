@@ -512,6 +512,9 @@ struct lc_op_ctx {
   std::unique_ptr<rgw::sal::PlacementTier> tier;
   const RGWObjTags* cached_tags{nullptr};
 
+  // Deferred deletion support
+  bool defer_delete_enabled{false};
+
   lc_op_ctx(op_env& env, rgw_bucket_dir_entry& o,
 	    boost::optional<std::string> next_key_name,
 	    uint64_t num_noncurrent,
@@ -638,6 +641,7 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   auto obj_key = o.key;
   auto& meta = o.meta;
   auto version_id = obj_key.instance; // deep copy, so not cleared below
+  bool missing_obj{false};
 
   /* per discussion w/Daniel, Casey,and Eric, we *do need*
    * a new sal object handle, based on the following decision
@@ -653,10 +657,19 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   auto obj = oc.bucket->get_object(obj_key);
   ret = obj->load_obj_state(dpp, y, true);
   if (ret < 0) {
-    /* for delete markers, we expect load_obj_state() to "fail"
-     * with -ENOENT */
-    if (! (o.is_delete_marker() &&
-	   (ret == -ENOENT))) {
+    if (ret == -ENOENT && (o.is_delete_marker() ||
+        (oc.defer_delete_enabled && remove_indeed &&
+         !oc.bucket->versioning_enabled() &&
+         !rgw::is_layout_indexless(bucket_info.layout.current_index)))) {
+      // delete markers are expected to return -ENOENT; deferred deletes
+      // may leave stale index entries after GC removes the head.
+      // The deferred-GC path is only active for non-versioned, indexed
+      // buckets (mirrors the gates in RGWRados::Object::Delete::delete_obj),
+      // so limit the stale-entry suppression to the same paths.
+      missing_obj = true;
+      ldpp_dout(oc.dpp, 5) << __func__ << "(): missing obj for key="
+                           << oc.o.key << ", forcing cleanup" << dendl;
+    } else {
       ldpp_dout(oc.dpp, 0) <<
 	fmt::format("ERROR: get_obj_state() failed in {} for object k={} error r={}",
 		    __func__, oc.o.key.to_string(), ret) << dendl;
@@ -665,14 +678,17 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   }
 
   auto have_notify = !event_types.empty();
-  if (have_notify) {
+  if (have_notify && !missing_obj) {
     auto attrset = obj->get_attrs();
     auto iter = attrset.find(RGW_ATTR_ETAG);
     if (iter != attrset.end()) {
       etag = rgw_bl_str(iter->second);
     }
   }
-  auto size = obj->get_size();
+  if (have_notify && etag.empty() && !meta.etag.empty()) {
+    etag = meta.etag;
+  }
+  auto size = missing_obj ? meta.size : obj->get_size();
 
   std::unique_ptr<rgw::sal::Object::DeleteOp> del_op
     = obj->get_delete_op();
@@ -682,9 +698,16 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   del_op->params.obj_owner.display_name = meta.owner_display_name;
   del_op->params.bucket_owner = bucket_info.owner;
   del_op->params.unmod_since = meta.mtime;
+  const bool zonegroup_ok = zonegroup_lc_check(dpp, oc.driver->get_zone());
+  if (oc.defer_delete_enabled && remove_indeed && zonegroup_ok && !missing_obj) {
+    del_op->params.defer_gc = true;
+  }
 
-  uint32_t flags = (!remove_indeed || !zonegroup_lc_check(dpp, oc.driver->get_zone()))
+  uint32_t flags = (!remove_indeed || !zonegroup_ok)
                    ? rgw::sal::FLAG_LOG_OP : 0;
+  if (missing_obj) {
+    flags |= rgw::sal::FLAG_FORCE_OP;
+  }
   ret =  del_op->delete_obj(dpp, y, flags);
   if (ret < 0) {
     ldpp_dout(dpp, 1) <<
@@ -1558,6 +1581,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
 {
   lc_op_ctx ctx(env, o, next_key_name, num_noncurrent, effective_mtime, dpp);
   ctx.cached_tags = cached_tags;
+  ctx.defer_delete_enabled = ctx.cct->_conf->rgw_lc_defer_delete;
   shared_ptr<LCOpAction> *selected = nullptr; // n.b., req'd by sharing
   real_time exp;
 

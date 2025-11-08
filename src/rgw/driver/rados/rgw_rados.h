@@ -45,6 +45,7 @@
 
 struct D3nDataCache;
 struct RGWLCCloudTierCtx;
+class PerfCounters;
 
 class RGWWatcher;
 class ACLOwner;
@@ -883,6 +884,7 @@ public:
 	bool abortmp;
 	uint64_t parts_accounted_size;
 	obj_version *check_objv;
+        bool defer_gc{false};
 
         DeleteParams() : versioning_status(0), null_verid(false), olh_epoch(0), bilog_flags(0), remove_objs(NULL), high_precision_time(false), zones_trace(nullptr), abortmp(false), parts_accounted_size(0), check_objv(nullptr) {}
       } params;
@@ -1327,7 +1329,8 @@ int restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
 		 rgw_zone_set *zones_trace = nullptr,
                  bool log_op = true,
                  const bool force = false, // if head object missing, do a best effort
-                 const bool skip_olh_obj_update = false); // true for all deletes (except the last one) initiated by a multi-object delete op
+                 const bool skip_olh_obj_update = false, // true for all deletes (except the last one) initiated by a multi-object delete op
+                 bool defer_gc = false);
 
   int delete_raw_obj(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, optional_yield y);
 
@@ -1619,9 +1622,11 @@ public:
   int unlock(const rgw_pool& pool, const std::string& oid, rgw_zone_id& zone_id, std::string& owner_id);
 
   void update_gc_chain(const DoutPrefixProvider *dpp, rgw_obj head_obj, RGWObjManifest& manifest, cls_rgw_obj_chain *chain);
-  std::tuple<int, std::optional<cls_rgw_obj_chain>> send_chain_to_gc(cls_rgw_obj_chain& chain, const std::string& tag, optional_yield y);
-  void delete_objs_inline(const DoutPrefixProvider *dpp, cls_rgw_obj_chain& chain,
-                          const std::string& tag, optional_yield y);
+  std::tuple<int, std::optional<cls_rgw_obj_chain>> send_chain_to_gc(cls_rgw_obj_chain& chain, const std::string& tag, const std::string& head_id_tag, optional_yield y);
+  int delete_objs_inline(const DoutPrefixProvider *dpp, cls_rgw_obj_chain& chain,
+                         const std::string& tag, optional_yield y,
+                         const cls_rgw_obj* deferred_head = nullptr,
+                         const std::string& head_id_tag = {});
   int gc_operate(const DoutPrefixProvider *dpp, std::string& oid, librados::ObjectWriteOperation&& op, optional_yield y);
   int gc_aio_operate(const std::string& oid, librados::AioCompletion *c,
                      librados::ObjectWriteOperation *op);

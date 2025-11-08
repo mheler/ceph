@@ -6188,7 +6188,7 @@ int RGWRados::Object::complete_atomic_modification(const DoutPrefixProvider *dpp
     //Delete objects inline just in case gc hasn't been initialised, prevents crashes
     store->delete_objs_inline(dpp, chain, tag, y);
   } else {
-    auto [ret, leftover_chain] = store->gc->send_split_chain(chain, tag, y); // do it synchronously
+    auto [ret, leftover_chain] = store->gc->send_split_chain(chain, tag, std::string(), y); // do it synchronously
     if (ret < 0 && leftover_chain) {
       //Delete objects inline if send chain to gc fails
       store->delete_objs_inline(dpp, *leftover_chain, tag, y);
@@ -6211,40 +6211,55 @@ void RGWRados::update_gc_chain(const DoutPrefixProvider *dpp, rgw_obj head_obj, 
   }
 }
 
-std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWRados::send_chain_to_gc(cls_rgw_obj_chain& chain, const string& tag, optional_yield y)
+std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWRados::send_chain_to_gc(cls_rgw_obj_chain& chain, const string& tag, const std::string& head_id_tag, optional_yield y)
 {
   if (chain.empty()) {
     return {0, std::nullopt};
   }
 
-  return gc->send_split_chain(chain, tag, y);
+  return gc->send_split_chain(chain, tag, head_id_tag, y);
 }
 
-void RGWRados::delete_objs_inline(const DoutPrefixProvider *dpp, cls_rgw_obj_chain& chain,
-                                  const string& tag, optional_yield y)
+int RGWRados::delete_objs_inline(const DoutPrefixProvider *dpp, cls_rgw_obj_chain& chain,
+                                 const string& tag, optional_yield y,
+                                 const cls_rgw_obj* deferred_head,
+                                 const std::string& head_id_tag)
 {
   if (chain.objs.empty()) {
-    return;
+    return 0;
   }
 
-  // initialize an IoCtx for the first object's pool. RGWObjManifest uses the
-  // same pool for all tail objects
-  auto obj = chain.objs.begin();
-
+  int ret = 0;
   librados::IoCtx ioctx;
-  int ret = rgw_init_ioctx(dpp, get_rados_handle(), obj->pool, ioctx);
-  if (ret < 0) {
-    return;
-  }
-  ioctx.set_pool_full_try();  // allow deletion at pool quota limit
+  std::string last_pool;
 
   // issue deletions in parallel, up to max_aio at a time
   auto aio = rgw::make_throttle(cct->_conf->rgw_multi_obj_del_max_aio, y);
   static constexpr uint64_t cost = 1; // 1 throttle unit per request
   static constexpr uint64_t id = 0; // ids unused
 
-  for (; obj != chain.objs.end(); ++obj) {
+  for (auto obj = chain.objs.begin(); obj != chain.objs.end(); ++obj) {
+    if (obj->pool != last_pool) {
+      int r = rgw_init_ioctx(dpp, get_rados_handle(), obj->pool, ioctx);
+      if (r < 0) {
+        ldpp_dout(dpp, 0) << "ERROR: failed to create ioctx pool="
+                          << obj->pool << dendl;
+        if (ret == 0) ret = r;
+        continue;
+      }
+      ioctx.set_pool_full_try();
+      last_pool = obj->pool;
+    }
+
     ObjectWriteOperation op;
+    if (deferred_head && !head_id_tag.empty() &&
+        obj->pool == deferred_head->pool &&
+        obj->key == deferred_head->key &&
+        obj->loc == deferred_head->loc) {
+      bufferlist expected;
+      expected.append(head_id_tag.c_str(), head_id_tag.size());
+      op.cmpxattr(RGW_ATTR_ID_TAG, LIBRADOS_CMPXATTR_OP_EQ, expected);
+    }
     cls_refcount_put(op, tag, true);
 
     rgw_raw_obj raw;
@@ -6254,11 +6269,14 @@ void RGWRados::delete_objs_inline(const DoutPrefixProvider *dpp, cls_rgw_obj_cha
 
     auto completed = aio->get(std::move(raw), rgw::Aio::librados_op(
             ioctx, std::move(op), y), cost, id);
-    std::ignore = rgw::check_for_errors(completed);
+    int r = rgw::check_for_errors(completed);
+    if (r < 0 && ret == 0) ret = r;
   }
 
   auto completed = aio->drain();
-  std::ignore = rgw::check_for_errors(completed);
+  int r = rgw::check_for_errors(completed);
+  if (r < 0 && ret == 0) ret = r;
+  return ret;
 }
 
 static void accumulate_raw_stats(const rgw_bucket_dir_header& header,
@@ -6525,6 +6543,10 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y,
     obj.key.instance.clear();
   }
 
+  RGWBucketInfo& bucket_info = target->get_bucket_info();
+  const bool defer_requested = params.defer_gc &&
+      (bucket_info.layout.current_index.layout.type != rgw::BucketIndexType::Indexless);
+
   bool explicit_marker_version = (!params.marker_version_id.empty());
 
   if (params.versioning_status & BUCKET_VERSIONED || explicit_marker_version) {
@@ -6740,7 +6762,32 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y,
     return r;
   }
 
-  RGWBucketInfo& bucket_info = target->get_bucket_info();
+  bool defer_active = false;
+  cls_rgw_obj_chain defer_chain;
+  cls_rgw_obj defer_head_obj;
+  std::string defer_tag;
+  std::string defer_head_id_tag;
+
+  if (defer_requested && store->get_gc() && state && state->exists) {
+    if (state->tail_tag.length() > 0) {
+      defer_tag = state->tail_tag.to_str();
+    } else if (state->obj_tag.length() > 0) {
+      defer_tag = state->obj_tag.to_str();
+    }
+    if (!defer_tag.empty()) {
+      defer_head_id_tag = state->obj_tag.to_str();
+      rgw_raw_obj raw_head;
+      const auto& placement = manifest ? manifest->get_head_placement_rule()
+                                       : bucket_info.placement_rule;
+      store->obj_to_raw(placement, obj, &raw_head);
+      defer_chain.push_obj(raw_head.pool.to_str(), cls_rgw_obj_key(raw_head.oid), raw_head.loc);
+      defer_head_obj = defer_chain.objs.back();
+      if (manifest && manifest->has_tail()) {
+        store->update_gc_chain(dpp, obj, *manifest, &defer_chain);
+      }
+      defer_active = true;
+    }
+  }
 
   RGWRados::Bucket bop(store, bucket_info);
   RGWRados::Bucket::UpdateIndex index_op(&bop, obj);
@@ -6757,47 +6804,119 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y,
     return r;
   }
 
-  store->remove_rgw_head_obj(op);
-
-  if (params.check_objv != nullptr) {
-    cls_version_check(op, *params.check_objv, VER_COND_EQ);
-  }
-
   auto& ioctx = ref.ioctx;
   ioctx.set_pool_full_try(); // allow deletion at pool quota limit
   version_t epoch = 0;
-  r = rgw_rados_operate(dpp, ioctx, ref.obj.oid, std::move(op), y, 0, nullptr, &epoch);
+  int64_t index_poolid = ioctx.get_id();
+  // Deferred deletes skip the synchronous head removal, so epoch stays 0.
+  // Use state->epoch + 1 as the complete_del() CAS guard: cls_rgw cancels when
+  // op.ver.epoch <= entry.ver.epoch, and in normal operation state->epoch equals
+  // the index's stored epoch (both come from the post-write RADOS snap_seq).
+  // After index repair or resharding these may diverge; if so, complete_del()
+  // is cancelled (recoverable via check_disk_state) or the GC cmpxattr guard fires.
+  if (defer_active && params.check_objv != nullptr) {
+    // check_objv is a RADOS CAS guard on the head-object op; deferring skips
+    // that op entirely, so the guard would be silently dropped.  Fall back to
+    // synchronous deletion to preserve the caller's version-check semantics.
+    ldpp_dout(dpp, 0) << "WARNING: deferred delete disabled: check_objv set, "
+                         "falling back to synchronous head removal" << dendl;
+    defer_active = false;
+  }
+  const bool was_deferred = defer_active;
+  version_t index_epoch = was_deferred ? state->epoch + 1 : epoch;
+  bool need_invalidate = false;
 
-  /* raced with another operation, object state is indeterminate */
-  const bool need_invalidate = (r == -ECANCELED);
+  if (!was_deferred) {
+    store->remove_rgw_head_obj(op);
 
-  int64_t poolid = ioctx.get_id();
-  if (r == -ETIMEDOUT) {
-    // rgw can't determine whether or not the delete succeeded, shouldn't be calling either of complete_del() or cancel()
-    // leaving that pending entry in the index so that bucket listing can recover with check_disk_state() and cls_rgw_suggest_changes()
-    ldpp_dout(dpp, 0) << "ERROR: rgw_rados_operate returned r=" << r << dendl;
-  } else if (r >= 0 || r == -ENOENT) {
-    tombstone_cache_t *obj_tombstone_cache = store->get_tombstone_cache();
-    if (obj_tombstone_cache) {
-      tombstone_entry entry{*state};
-      obj_tombstone_cache->add(obj, entry);
+    if (params.check_objv != nullptr) {
+      cls_version_check(op, *params.check_objv, VER_COND_EQ);
     }
-    r = index_op.complete_del(dpp, poolid, epoch, state->mtime, params.remove_objs, y, log_op);
 
+    int head_ret = rgw_rados_operate(dpp, ioctx, ref.obj.oid, std::move(op), y, 0, nullptr, &epoch);
+
+    /* raced with another operation, object state is indeterminate */
+    need_invalidate = (head_ret == -ECANCELED);
+
+    if (head_ret == -ETIMEDOUT) {
+      // rgw can't determine whether or not the delete succeeded, shouldn't be calling either of complete_del() or cancel()
+      // leaving that pending entry in the index so that bucket listing can recover with check_disk_state() and cls_rgw_suggest_changes()
+      ldpp_dout(dpp, 0) << "ERROR: rgw_rados_operate returned r=" << head_ret << dendl;
+      if (need_invalidate) {
+        target->invalidate_state();
+      }
+      return head_ret;
+    } else if (head_ret >= 0 || head_ret == -ENOENT) {
+      index_poolid = ioctx.get_id();
+      index_epoch = epoch;
+      if (tombstone_cache_t *obj_tombstone_cache = store->get_tombstone_cache()) {
+        tombstone_entry entry{*state};
+        obj_tombstone_cache->add(obj, entry);
+      }
+    } else {
+      int ret = index_op.cancel(dpp, params.remove_objs, y, log_op);
+      if (ret < 0) {
+        ldpp_dout(dpp, 0) << "ERROR: index_op.cancel() returned ret=" << ret << dendl;
+      }
+      if (need_invalidate) {
+        target->invalidate_state();
+      }
+      return head_ret;
+    }
+  }
+
+  // Commit to GC while the BI pending entry (from prepare()) is still
+  // intact.  If we crash before this point the pending entry survives
+  // and check_disk_state() will recover it; LC retries on the next cycle.
+  // If we crash after this point but before complete_del(), both the GC
+  // entry and the BI pending entry are durable — fully recoverable.
+  if (was_deferred) {
+    auto [gc_ret, leftover_chain] = store->send_chain_to_gc(defer_chain, defer_tag, defer_head_id_tag, y);
+    if (gc_ret >= 0) {
+      if (perfcounter) perfcounter->inc(l_rgw_lc_defer_queued, 1);
+    } else {
+      // GC enqueue failed — try inline deletion.
+      // Only head deletion is critical for index consistency; tail failures
+      // are best-effort (orphan scan handles stragglers, same as
+      // complete_atomic_modification).
+      cls_rgw_obj_chain head_chain;
+      head_chain.push_obj(defer_head_obj.pool, defer_head_obj.key, defer_head_obj.loc);
+      int inline_ret = store->delete_objs_inline(dpp, head_chain, defer_tag, y,
+                                                 &defer_head_obj, defer_head_id_tag);
+      if (inline_ret == -ECANCELED || inline_ret == -ENODATA) {
+        inline_ret = 0;  // head overwritten; new owner is responsible for cleanup
+      }
+      if (inline_ret < 0) {
+        // Head still alive — cancel the pending BI entry so LC retries on
+        // the next cycle rather than orphaning the object permanently.
+        ldpp_dout(dpp, 0) << "ERROR: deferred delete inline head deletion failed: "
+                           << inline_ret << "; cancelling index op for LC retry" << dendl;
+        index_op.cancel(dpp, params.remove_objs, y, log_op);
+        return inline_ret;
+      }
+      // Head deleted; delete tails best-effort
+      cls_rgw_obj_chain tail_chain = defer_chain;
+      tail_chain.objs.erase(tail_chain.objs.begin());
+      if (!tail_chain.objs.empty()) {
+        store->delete_objs_inline(dpp, tail_chain, defer_tag, y);
+      }
+      if (perfcounter) perfcounter->inc(l_rgw_lc_defer_inline, 1);
+    }
+  }
+
+  r = index_op.complete_del(dpp, index_poolid, index_epoch, state->mtime,
+                            params.remove_objs, y, log_op);
+
+  if (!was_deferred) {
     int ret = target->complete_atomic_modification(dpp, false, y);
     if (ret < 0) {
       ldpp_dout(dpp, 0) << "ERROR: complete_atomic_modification returned ret=" << ret << dendl;
     }
-    /* other than that, no need to propagate error */
-  } else {
-    int ret = index_op.cancel(dpp, params.remove_objs, y, log_op);
-    if (ret < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: index_op.cancel() returned ret=" << ret << dendl;
+    // need_invalidate is only set inside the !was_deferred head-removal
+    // block above (on -ECANCELED), so this check belongs here.
+    if (need_invalidate) {
+      target->invalidate_state();
     }
-  }
-
-  if (need_invalidate) {
-    target->invalidate_state();
   }
 
   if (r < 0) {
@@ -6806,6 +6925,14 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y,
 
   /* update quota cache */
   store->quota_handler->update_stats(params.bucket_owner, obj.bucket, -1, 0, obj_accounted_size);
+
+  if (was_deferred) {
+    if (tombstone_cache_t *obj_tombstone_cache = store->get_tombstone_cache()) {
+      tombstone_entry entry{*state};
+      // Tombstone reflects logical delete immediately, even if GC still holds data
+      obj_tombstone_cache->add(obj, entry);
+    }
+  }
 
   return 0;
 }
@@ -6820,8 +6947,9 @@ int RGWRados::delete_obj(const DoutPrefixProvider *dpp,
                          const real_time& expiration_time,
                          rgw_zone_set *zones_trace,
                          bool log_op,
-                         const bool force, // force removal even if head object is broken
-                         const bool skip_olh_obj_update) // true for all deletes (except the last one) initiated by a multi-object delete op
+                         const bool force,
+                         const bool skip_olh_obj_update,
+                         bool defer_gc)
 {
   RGWRados::Object del_target(this, bucket_info, obj_ctx, obj);
   RGWRados::Object::Delete del_op(&del_target);
@@ -6832,6 +6960,7 @@ int RGWRados::delete_obj(const DoutPrefixProvider *dpp,
   del_op.params.expiration_time = expiration_time;
   del_op.params.zones_trace = zones_trace;
   del_op.params.null_verid = null_verid;
+  del_op.params.defer_gc = defer_gc;
 
   return del_op.delete_obj(y, dpp, log_op, force, skip_olh_obj_update);
 }
@@ -9397,7 +9526,8 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
     rgw_obj obj_instance(bucket, key);
     int ret = delete_obj(dpp, obj_ctx, bucket_info, obj_instance, 0, y,
 			 null_verid, RGW_BILOG_FLAG_VERSIONED_OP,
-			 ceph::real_time(), zones_trace, log_op, force, true /* skip_olh_obj_update */);
+			 ceph::real_time(), zones_trace, log_op, force,
+			 true /* skip_olh_obj_update */);
     if (ret < 0 && ret != -ENOENT) {
       ldpp_dout(dpp, 0) << "ERROR: delete_obj() returned " << ret << " obj_instance=" << obj_instance << dendl;
       return ret;
@@ -9716,6 +9846,9 @@ int RGWRados::unlink_obj_instance(const DoutPrefixProvider* dpp,
     return 0;
   }
 
+  // defer_gc is intentionally not propagated to OLH cleanup: apply_olh_log
+  // processes all remove_instances entries (not just the LC-targeted one),
+  // so applying GC deferral here would affect collateral stale versions too.
   ret = update_olh(dpp, obj_ctx, state, bucket_info, olh_obj, y,
 		   zones_trace, null_verid, log_op, force);
   if (ret == -ECANCELED) { /* already did what we needed, no need to retry, raced with another user */

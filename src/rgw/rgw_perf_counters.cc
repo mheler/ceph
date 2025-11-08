@@ -45,6 +45,10 @@ void add_rgw_frontend_counters(PerfCountersBuilder *pcb) {
 		      "Lifecycle non-current transition");
   pcb->add_u64_counter(l_rgw_lc_abort_mpu, "lc_abort_mpu",
 		      "Lifecycle abort multipart upload");
+  pcb->add_u64_counter(l_rgw_lc_defer_queued, "lc_defer_queued",
+	      "Lifecycle deferred deletes queued to GC");
+  pcb->add_u64_counter(l_rgw_lc_defer_fallback_inline, "lc_defer_inline",
+	      "Lifecycle deferred deletes processed inline");
 
   pcb->add_u64_counter(l_rgw_pubsub_event_triggered, "pubsub_event_triggered", "Pubsub events with at least one topic");
   pcb->add_u64_counter(l_rgw_pubsub_event_lost, "pubsub_event_lost", "Pubsub events lost");

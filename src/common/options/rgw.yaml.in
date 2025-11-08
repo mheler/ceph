@@ -505,6 +505,32 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_defer_delete
+  type: bool
+  level: advanced
+  desc: Defer LC object deletion to GC for improved performance
+  long_desc: When enabled, lifecycle removes the bucket index entry immediately but
+    queues the object data to RGW GC for asynchronous deletion. Use this only when GC
+    threads are enabled and sized appropriately; if GC is unavailable the delete falls
+    back to the synchronous path. Objects become immediately inaccessible via S3 once
+    the index entry is removed.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_defer_skip_guard
+  type: bool
+  level: dev
+  desc: Skip writing the omap guard during deferred LC deletion (testing only)
+  long_desc: When true, skips writing the omap guard entry during deferred LC deletion.
+    This means GET/HEAD requests may return object data briefly after LC removes
+    the bucket index entry, until GC actually deletes the object. The CMPXATTR guard
+    on the object itself still prevents deleting overwritten objects. Use only for
+    performance testing to isolate guard overhead.
+  default: false
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_restore_debug_interval
   type: int
   level: dev

@@ -14,6 +14,7 @@
 #include "cls/rgw/cls_rgw_types.h"
 
 #include <atomic>
+#include <vector>
 
 class RGWGCIOManager;
 
@@ -25,9 +26,12 @@ class RGWGC : public DoutPrefixProvider {
   std::atomic<bool> down_flag = { false };
 
   static constexpr uint64_t seed = 8675309;
-
   int tag_index(const std::string& tag);
-  int send_chain(const cls_rgw_obj_chain& chain, const std::string& tag, optional_yield y);
+public:
+  int guard_clear(const std::string& tag, const std::string& head_id_tag, optional_yield y);
+  int guard_exists(const std::string& head_id_tag, const std::string& tag, bool *result, optional_yield y);
+  bool guard_enabled() const;
+  int send_chain(const cls_rgw_obj_chain& chain, const std::string& tag, const std::string& head_id_tag, optional_yield y);
 
   class GCWorker : public Thread {
     const DoutPrefixProvider *dpp;
@@ -50,7 +54,7 @@ public:
     finalize();
   }
   std::vector<bool> transitioned_objects_cache;
-  std::tuple<int, std::optional<cls_rgw_obj_chain>> send_split_chain(const cls_rgw_obj_chain& chain, const std::string& tag, optional_yield y);
+  std::tuple<int, std::optional<cls_rgw_obj_chain>> send_split_chain(const cls_rgw_obj_chain& chain, const std::string& tag, const std::string& head_id_tag, optional_yield y);
 
   // asynchronously defer garbage collection on an object that's still being read
   int async_defer_chain(const std::string& tag, const cls_rgw_obj_chain& info);

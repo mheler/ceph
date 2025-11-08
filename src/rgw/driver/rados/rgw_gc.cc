@@ -66,10 +66,60 @@ int RGWGC::tag_index(const string& tag)
   return rgw_shards_mod(XXH64(tag.c_str(), tag.size(), seed), max_objs);
 }
 
-std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const cls_rgw_obj_chain& chain, const std::string& tag, optional_yield y)
+bool RGWGC::guard_enabled() const
+{
+  return cct && cct->_conf->rgw_lc_defer_delete;
+}
+
+int RGWGC::guard_clear(const string& tag, const string& head_id_tag, optional_yield y)
+{
+  if (!guard_enabled() || head_id_tag.empty()) {
+    return 0;
+  }
+  const int idx = tag_index(tag);
+  ObjectWriteOperation op;
+  std::set<std::string> keys{head_id_tag};
+  op.omap_rm_keys(keys);
+  return store->gc_operate(this, obj_names[idx], std::move(op), y);
+}
+
+int RGWGC::guard_exists(const string& head_id_tag, const std::string& tag, bool *result, optional_yield y)
+{
+  if (!result) {
+    return -EINVAL;
+  }
+  *result = false;
+
+  if (!guard_enabled() || head_id_tag.empty()) {
+    return 0;
+  }
+  const int idx = tag_index(tag);
+
+  ObjectReadOperation op;
+  std::set<std::string> keys{head_id_tag};
+  std::map<std::string, bufferlist> vals;
+  op.omap_get_vals_by_keys(keys, &vals, nullptr);
+  int ret = store->gc_operate(this, obj_names[idx], std::move(op), nullptr, y);
+  if (ret < 0) {
+    return ret;
+  }
+  // Existence check only - key is head_id_tag which is unique per object version
+  *result = !vals.empty();
+  return 0;
+}
+
+std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const cls_rgw_obj_chain& chain, const std::string& tag, const std::string& head_id_tag, optional_yield y)
 {
   ldpp_dout(this, 20) << "RGWGC::send_split_chain - tag is: " << tag << dendl;
 
+  bool head_tag_pending = true;
+  auto next_head_tag = [&]() {
+    if (!head_tag_pending) {
+      return std::string{};
+    }
+    head_tag_pending = false;
+    return head_id_tag;
+  };
   if (cct->_conf->rgw_max_chunk_size) {
     cls_rgw_obj_chain broken_chain;
     cls_rgw_gc_set_entry_op op;
@@ -90,7 +140,8 @@ std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const 
         broken_chain.objs.pop_back();
         --it;
         ldpp_dout(this, 20) << "RGWGC::send_split_chain - more than, dont add to broken chain and send chain" << dendl;
-        auto ret = send_chain(broken_chain, tag, y);
+        auto head_tag = next_head_tag();
+        auto ret = send_chain(broken_chain, tag, head_tag, y);
         if (ret < 0) {
           broken_chain.objs.insert(broken_chain.objs.end(), it, chain.objs.end()); // add all the remainder objs to the list to be deleted inline
           ldpp_dout(this, 0) << "RGWGC::send_split_chain - send chain returned error: " << ret << dendl;
@@ -102,14 +153,16 @@ std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const 
     }
     if (!broken_chain.objs.empty()) { //when the chain is smaller than or equal to rgw_max_chunk_size
       ldpp_dout(this, 20) << "RGWGC::send_split_chain - sending leftover objects" << dendl;
-      auto ret = send_chain(broken_chain, tag, y);
+      auto head_tag = next_head_tag();
+      auto ret = send_chain(broken_chain, tag, head_tag, y);
       if (ret < 0) {
         ldpp_dout(this, 0) << "RGWGC::send_split_chain - send chain returned error: " << ret << dendl;
         return {ret, {broken_chain}};
       }
     }
   } else {
-    auto ret = send_chain(chain, tag, y);
+    auto head_tag = next_head_tag();
+    auto ret = send_chain(chain, tag, head_tag, y);
     if (ret < 0) {
       ldpp_dout(this, 0) << "RGWGC::send_split_chain - send chain returned error: " << ret << dendl;
       return {ret, {std::move(chain)}};
@@ -118,25 +171,33 @@ std::tuple<int, std::optional<cls_rgw_obj_chain>> RGWGC::send_split_chain(const 
   return {0, {}};
 }
 
-int RGWGC::send_chain(const cls_rgw_obj_chain& chain, const string& tag, optional_yield y)
+int RGWGC::send_chain(const cls_rgw_obj_chain& chain, const string& tag, const string& head_id_tag, optional_yield y)
 {
   ObjectWriteOperation op;
+
+  /* Set guard atomically with GC enqueue (same op, same gc.N shard).
+   * Key by head_id_tag (32 bytes, fixed) for minimal omap overhead.
+   * Value is empty since existence check is sufficient - head_id_tag
+   * is unique per object version.
+   * Require non-empty chain to ensure guard will eventually be cleared.
+   */
+  if (guard_enabled() && !cct->_conf->rgw_lc_defer_skip_guard &&
+      !head_id_tag.empty() && !chain.objs.empty()) {
+    bufferlist empty_val;
+    op.omap_set({{head_id_tag, empty_val}});
+  }
+
   cls_rgw_gc_obj_info info;
   info.chain = chain;
   info.tag = tag;
+  info.head_id_tag = head_id_tag;
   gc_log_enqueue2(op, cct->_conf->rgw_gc_obj_min_wait, info);
 
   int i = tag_index(tag);
 
-  ldpp_dout(this, 20) << "RGWGC::send_chain - on object name: " << obj_names[i] << "tag is: " << tag << dendl;
+  ldpp_dout(this, 20) << "RGWGC::send_chain - on object name: " << obj_names[i] << " tag is: " << tag << dendl;
 
-  auto ret = store->gc_operate(this, obj_names[i], std::move(op), y);
-  if (ret != -ECANCELED && ret != -EPERM) {
-    return ret;
-  }
-  ObjectWriteOperation set_entry_op;
-  cls_rgw_gc_set_entry(set_entry_op, cct->_conf->rgw_gc_obj_min_wait, info);
-  return store->gc_operate(this, obj_names[i], std::move(set_entry_op), y);
+  return store->gc_operate(this, obj_names[i], std::move(op), y);
 }
 
 struct defer_chain_state {
@@ -168,6 +229,10 @@ void RGWGC::on_defer_canceled(const cls_rgw_gc_obj_info& info)
 
   // ECANCELED from cls_version_check() tells us that we've transitioned
   transitioned_objects_cache[i] = true;
+
+  if (!info.head_id_tag.empty()) {
+    guard_clear(tag, info.head_id_tag, null_yield);
+  }
 
   ObjectWriteOperation op;
   cls_rgw_gc_queue_defer_entry(op, cct->_conf->rgw_gc_obj_min_wait, info);
@@ -367,6 +432,8 @@ class RGWGCIOManager {
     string oid;
     int index{-1};
     string tag;
+    bool guarded_head{false};
+    string head_id_tag;
   };
 
   deque<IO> ios;
@@ -395,7 +462,8 @@ public:
   }
 
   int schedule_io(IoCtx *ioctx, const string& oid, ObjectWriteOperation *op,
-		  int index, const string& tag) {
+		  int index, const string& tag, bool guarded_head = false,
+		  const string& head_id_tag = {}) {
     while (ios.size() > max_aio) {
       if (gc->going_down()) {
         return 0;
@@ -412,7 +480,7 @@ public:
     if (ret < 0) {
       return ret;
     }
-    ios.push_back(IO{IO::TailIO, c.get(), oid, index, tag});
+    ios.push_back(IO{IO::TailIO, c.get(), oid, index, tag, guarded_head, head_id_tag});
     c.release();
 
     return 0;
@@ -425,8 +493,24 @@ public:
     int ret = io.c->get_return_value();
     io.c->release();
 
+    if (ret < 0 && io.guarded_head) {
+      if (ret == -ECANCELED || ret == -ENODATA) {
+        ldpp_dout(dpp, 10) << "GC skipped deferred head " << io.oid
+                           << " because write tag changed" << dendl;
+        ret = 0;
+      }
+    }
+
     if (ret == -ENOENT) {
       ret = 0;
+    }
+
+    if (io.guarded_head && ret >= 0 && !io.head_id_tag.empty()) {
+      int guard_ret = gc->guard_clear(io.tag, io.head_id_tag, null_yield);
+      if (guard_ret < 0 && guard_ret != -ENOENT) {
+        ldpp_dout(dpp, 10) << "WARNING: failed to clear gc guard for head_id_tag=" << io.head_id_tag
+                           << " ret=" << guard_ret << dendl;
+      }
     }
 
     if (io.type == IO::IndexIO && ! gc->transitioned_objects_cache[io.index]) {
@@ -668,6 +752,8 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
         }
       }
       if (! chain.objs.empty()) {
+        const bool guarding_head = !info.head_id_tag.empty();
+        size_t chain_index = 0;
 	for (const auto& obj : chain.objs) {
 	  if (obj.pool != last_pool) {
 	    delete ctx;
@@ -693,22 +779,35 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
 	  ldpp_dout(this, 5) << "RGWGC::process removing " << obj.pool <<
 	    ":" << obj.key.name << dendl;
 	  ObjectWriteOperation op;
+          /* Guard head objects enqueued by LC to prevent deleting overwritten objects.
+           * If head_id_tag is empty: delete unconditionally (backward compat or unguarded object).
+           * If head_id_tag is non-empty: add CMPXATTR check requiring RGW_ATTR_ID_TAG to match.
+           * On CMPXATTR failure (-ECANCELED): object is preserved, queue entry still removed.
+           */
+          if (guarding_head && chain_index == 0 && !info.head_id_tag.empty()) {
+            bufferlist expected;
+            expected.append(info.head_id_tag.c_str(), info.head_id_tag.size());
+            op.cmpxattr(RGW_ATTR_ID_TAG, CEPH_OSD_CMPXATTR_OP_EQ, expected);
+          }
 	  cls_refcount_put(op, info.tag, true);
 
-	  ret = io_manager.schedule_io(ctx, oid, &op, index, info.tag);
+	  ret = io_manager.schedule_io(ctx, oid, &op, index, info.tag,
+                                       guarding_head && chain_index == 0,
+                                       info.head_id_tag);
 	  if (ret < 0) {
 	    ldpp_dout(this, 0) <<
 	      "WARNING: failed to schedule deletion for oid=" << oid << dendl;
-      if (transitioned_objects_cache[index]) {
-        //If deleting oid failed for any of them, we will not delete queue entries
-        goto done;
-      }
+	    if (transitioned_objects_cache[index]) {
+	      //If deleting oid failed for any of them, we will not delete queue entries
+	      goto done;
+	    }
 	  }
 	  if (going_down()) {
 	    // leave early, even if tag isn't removed, it's ok since it
 	    // will be picked up next time around
 	    goto done;
 	  }
+          ++chain_index;
 	} // chains loop
       } // else -- chains not empty
     } // entries loop

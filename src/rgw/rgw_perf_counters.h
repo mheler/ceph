@@ -34,6 +34,8 @@ enum {
   l_rgw_lc_transition_current,
   l_rgw_lc_transition_noncurrent,
   l_rgw_lc_abort_mpu,
+  l_rgw_lc_defer_queued,
+  l_rgw_lc_defer_fallback_inline,
 
   l_rgw_pubsub_event_triggered,
   l_rgw_pubsub_event_lost,

@@ -3040,8 +3040,11 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   RGWAccessKey key = rtier->get_rt().t.s3.key;
   string region = rtier->get_rt().t.s3.region;
   HostStyle host_style = rtier->get_rt().t.s3.host_style;
-  string bucket_name = rtier->get_rt().t.s3.target_path;
   const rgw::sal::ZoneGroup& zonegroup = store->get_zone()->get_zonegroup();
+  string bucket_name = rtier->get_rt().t.s3.make_target_bucket_name(
+      zonegroup.get_name(),
+      tier->get_storage_class(), bucket->get_name(),
+      bucket->get_tenant());
   int ret = 0;
 
   auto& attrs = get_attrs();
@@ -3063,12 +3066,6 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   // update tier_config in case tier params are updated
   tier_config.tier_placement = rtier->get_rt();
 
-  if (bucket_name.empty()) {
-    bucket_name = "rgwx-" + zonegroup.get_name() + "-" + tier->get_storage_class() +
-                    "-cloud-bucket";
-    boost::algorithm::to_lower(bucket_name);
-  }
-
   rgw_bucket_dir_entry ent;
   ent.key.name = get_key().name;
   ent.key.instance = get_key().instance;
@@ -3085,7 +3082,8 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   // save source cloudtier storage class
   RGWLCCloudTierCtx tier_ctx(cct, dpp, ent, store, bucket->get_info(),
            this, conn, bucket_name,
-           rtier->get_rt().t.s3.target_storage_class);
+           rtier->get_rt().t.s3.target_storage_class,
+           rtier->get_rt().t.s3.target_by_bucket);
   tier_ctx.acl_mappings = rtier->get_rt().t.s3.acl_mappings;
   tier_ctx.multipart_min_part_size = rtier->get_rt().t.s3.multipart_min_part_size;
   tier_ctx.multipart_sync_threshold = rtier->get_rt().t.s3.multipart_sync_threshold;
@@ -3147,21 +3145,19 @@ int RadosObject::transition_to_cloud(Bucket* bucket,
   RGWAccessKey key = rtier->get_rt().t.s3.key;
   string region = rtier->get_rt().t.s3.region;
   HostStyle host_style = rtier->get_rt().t.s3.host_style;
-  string bucket_name = rtier->get_rt().t.s3.target_path;
   const rgw::sal::ZoneGroup& zonegroup = store->get_zone()->get_zonegroup();
-
-  if (bucket_name.empty()) {
-    bucket_name = "rgwx-" + zonegroup.get_name() + "-" + tier->get_storage_class() +
-                    "-cloud-bucket";
-    boost::algorithm::to_lower(bucket_name);
-  }
+  string bucket_name = rtier->get_rt().t.s3.make_target_bucket_name(
+      zonegroup.get_name(),
+      tier->get_storage_class(), bucket->get_name(),
+      bucket->get_tenant());
 
   /* Create RGW REST connection */
   S3RESTConn conn(cct, id, { endpoint }, key, zonegroup.get_id(), region, host_style);
 
   RGWLCCloudTierCtx tier_ctx(cct, dpp, o, store, bucket->get_info(),
 			     this, conn, bucket_name,
-			     rtier->get_rt().t.s3.target_storage_class);
+			     rtier->get_rt().t.s3.target_storage_class,
+			     rtier->get_rt().t.s3.target_by_bucket);
   tier_ctx.acl_mappings = rtier->get_rt().t.s3.acl_mappings;
   tier_ctx.multipart_min_part_size = rtier->get_rt().t.s3.multipart_min_part_size;
   tier_ctx.multipart_sync_threshold = rtier->get_rt().t.s3.multipart_sync_threshold;

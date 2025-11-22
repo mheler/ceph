@@ -50,6 +50,8 @@ Cloud Storage Class Tier Configuration
                 "dest_id": <dest_id> } ... ],
     "location_constraint": <location-constraint>,
     "target_path": <target_path>,
+    "target_by_bucket": <true | false>,
+    "target_by_bucket_prefix": <template>,
     "target_storage_class": <target-storage-class>,
     "multipart_sync_threshold": {object_size},
     "multipart_min_part_size": {part_size},
@@ -109,9 +111,21 @@ Cloud Transition Specific Configurables
 
   A string that defines how the target path is constructed. The target path
   specifies a prefix to which the source bucket-name/object-name is appended.
-  If not specified the ``target_path`` created is ``rgwx-${zonegroup}-${storage-class}-cloud-bucket``.
+  If not specified and ``target_by_bucket`` is false, the ``target_path`` created is ``rgwx-${zonegroup}-${storage_class}-cloud-bucket``.
+  When ``target_by_bucket`` is true, the default target path becomes ``rgwx-${zonegroup}-${storage_class}-${bucket}``.
 
   For example: ``target_path = rgwx-archive-${zonegroup}/``
+
+* ``target_by_bucket`` (boolean)
+
+  If set to ``true``, each source bucket transitions to its own destination bucket instead of sharing a single target bucket. Defaults to ``false`` to preserve the legacy behavior.
+
+* ``target_by_bucket_prefix`` (string)
+
+  Optional template used when ``target_by_bucket`` is true to derive the destination bucket name. Supports the variables ``${zonegroup}``, ``${storage_class}`` and ``${bucket}``. If unset, the template falls back to the built-in default ``rgwx-${zonegroup}-${storage_class}-${bucket}``.
+
+.. note::
+   S3 bucket naming constraints still apply on the destination side (lowercase letters and numbers, 3-63 characters, no slashes). RGW lowercases the derived bucket name, however if you include slashes or other invalid characters in a custom template, bucket creation may still fail on the target cloud.
 
 * ``location_constraint`` (string)
 

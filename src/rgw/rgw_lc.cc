@@ -30,6 +30,7 @@
 #include "rgw_bucket_layout.h"
 #include "rgw_lc.h"
 #include "rgw_zone.h"
+#include "rgw_cloud_delete.h"
 #include "rgw_string.h"
 #include "rgw_multi.h"
 #include "rgw_sal.h"
@@ -662,15 +663,17 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
     }
   }
 
+  auto& attrs = obj->get_attrs();
   auto have_notify = !event_types.empty();
   if (have_notify) {
-    auto attrset = obj->get_attrs();
-    auto iter = attrset.find(RGW_ATTR_ETAG);
-    if (iter != attrset.end()) {
+    auto iter = attrs.find(RGW_ATTR_ETAG);
+    if (iter != attrs.end()) {
       etag = rgw_bl_str(iter->second);
     }
   }
   auto size = obj->get_size();
+
+  rgw::cloud_delete::CloudDeleteContext cloud_ctx;
 
   std::unique_ptr<rgw::sal::Object::DeleteOp> del_op
     = obj->get_delete_op();
@@ -680,6 +683,14 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   del_op->params.obj_owner.display_name = meta.owner_display_name;
   del_op->params.bucket_owner = bucket_info.owner;
   del_op->params.unmod_since = meta.mtime;
+  if (remove_indeed) {
+    const rgw::sal::Attrs* attrs_for_cloud = (ret >= 0 ? &attrs : nullptr);
+    cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+        dpp, driver, obj.get(), false,
+        oc.bucket->get_key(), bucket_info.owner, y, attrs_for_cloud);
+    rgw::cloud_delete::maybe_set_check_objv(cloud_ctx,
+                                            &del_op->params.check_objv);
+  }
 
   uint32_t flags = (!remove_indeed || !zonegroup_lc_check(dpp, oc.driver->get_zone()))
                    ? rgw::sal::FLAG_LOG_OP : 0;
@@ -692,6 +703,10 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
       send_notification(dpp, y, driver, obj.get(), oc.bucket, etag, size,
 			version_id, event_types);
     }
+
+    rgw::cloud_delete::maybe_enqueue_after_delete(
+        dpp, driver, cloud_ctx, del_op->result.version_id,
+        true, del_op->result.delete_marker, y);
   }
 
   return ret;
@@ -3001,4 +3016,3 @@ void RGWLifecycleConfiguration::dump(Formatter *f) const
   }
   f->close_section();
 }
-

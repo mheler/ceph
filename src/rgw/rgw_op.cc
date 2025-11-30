@@ -70,6 +70,7 @@
 #include "rgw_bucket_logging.h"
 #include "rgw_restore.h"
 #include "rgw_restore_waiter.h"
+#include "rgw_cloud_delete.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_quota.h"
@@ -5702,6 +5703,7 @@ void RGWDeleteObj::execute(optional_yield y)
     uint64_t obj_size = 0;
     std::string etag;
     bool null_verid;
+    rgw::cloud_delete::CloudDeleteContext cloud_ctx;
     {
       int state_loaded = -1;
       bool check_obj_lock = s->object->have_instance() && s->bucket->get_info().obj_lock_enabled();
@@ -5724,7 +5726,12 @@ void RGWDeleteObj::execute(optional_yield y)
         }
       } else {
         obj_size = s->object->get_size();
-        etag = s->object->get_attrs()[RGW_ATTR_ETAG].to_str();
+        auto& attrs = s->object->get_attrs();
+        etag = attrs[RGW_ATTR_ETAG].to_str();
+        bool is_versioned_delete_marker = s->bucket->versioning_enabled() && s->object->get_instance().empty();
+        cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+            this, driver, s->object.get(), is_versioned_delete_marker,
+            s->bucket->get_key(), s->bucket_owner.id, y, &attrs);
       }
 
       // ignore return value from get_obj_attrs in all other cases
@@ -5784,6 +5791,7 @@ void RGWDeleteObj::execute(optional_yield y)
       return;
     }
 
+    bool delete_succeeded = false;  // Track actual delete success before normalization
     if (!ver_restored) {
       uint64_t epoch = 0;
 
@@ -5807,12 +5815,19 @@ void RGWDeleteObj::execute(optional_yield y)
       del_op->params.null_verid = null_verid;
       del_op->params.size_match = size_match;
       del_op->params.if_match = if_match;
+      rgw::cloud_delete::maybe_set_check_objv(cloud_ctx,
+                                              &del_op->params.check_objv);
 
       op_ret = del_op->delete_obj(this, y, rgw::sal::FLAG_LOG_OP);
       if (op_ret >= 0) {
 	delete_marker = del_op->result.delete_marker;
 	version_id = del_op->result.version_id;
+        delete_succeeded = true;
       }
+
+      rgw::cloud_delete::maybe_enqueue_after_delete(
+          this, driver, cloud_ctx, version_id,
+          delete_succeeded, delete_marker, y);
 
       /* Check whether the object has expired. Swift API documentation
        * stands that we should return 404 Not Found in such case. */
@@ -7704,6 +7719,7 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
 
   uint64_t obj_size = 0;
   std::string etag;
+  rgw::cloud_delete::CloudDeleteContext cloud_ctx;
 
   if (!rgw::sal::Object::empty(obj.get())) {
     int state_loaded = -1;
@@ -7721,7 +7737,12 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
       }
     } else {
       obj_size = obj->get_size();
-      etag = obj->get_attrs()[RGW_ATTR_ETAG].to_str();
+      auto& attrs = obj->get_attrs();
+      etag = attrs[RGW_ATTR_ETAG].to_str();
+      bool is_versioned_delete_marker = s->bucket->versioning_enabled() && object.get_version_id().empty();
+      cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+          dpp, driver, obj.get(), is_versioned_delete_marker,
+          s->bucket->get_key(), s->bucket_owner.id, y, &attrs);
     }
 
     if (check_obj_lock) {
@@ -7758,9 +7779,13 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   del_op->params.last_mod_time_match = object.get_last_mod_time();
   del_op->params.if_match = object.get_if_match();
   del_op->params.size_match = object.get_size_match();
+  rgw::cloud_delete::maybe_set_check_objv(cloud_ctx,
+                                          &del_op->params.check_objv);
 
   op_ret = del_op->delete_obj(dpp, y,
                               rgw::sal::FLAG_LOG_OP | (skip_olh_obj_update ? rgw::sal::FLAG_SKIP_UPDATE_OLH : 0));
+  // Track actual success before normalization for cloud delete decision
+  bool delete_succeeded = (op_ret >= 0);
   if (op_ret == -ENOENT) {
     op_ret = 0;
   }
@@ -7778,8 +7803,12 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
       // too late to rollback operation, hence op_ret is not set here
     }
   }
-  
+
   send_partial_response(o, del_op->result.delete_marker, del_op->result.version_id, op_ret);
+
+  rgw::cloud_delete::maybe_enqueue_after_delete(
+      dpp, driver, cloud_ctx, del_op->result.version_id,
+      delete_succeeded, del_op->result.delete_marker, y);
 }
 
 void RGWDeleteMultiObj::handle_versioned_objects(const std::vector<RGWMultiDelObject>& objects,
@@ -7993,15 +8022,29 @@ bool RGWBulkDelete::Deleter::delete_single(const acct_path_t& path, optional_yie
     std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(path.obj_key);
     obj->set_atomic(true);
 
+    bool is_versioned_delete_marker = bucket->versioning_enabled() && path.obj_key.instance.empty();
+    auto cloud_obj = obj->clone();
+    rgw::cloud_delete::CloudDeleteContext cloud_ctx =
+        rgw::cloud_delete::prepare_cloud_delete_context(
+            dpp, driver, cloud_obj.get(), is_versioned_delete_marker,
+            bucket->get_key(), bucket->get_info().owner, y);
+
     std::unique_ptr<rgw::sal::Object::DeleteOp> del_op = obj->get_delete_op();
     del_op->params.versioning_status = obj->get_bucket()->get_info().versioning_status();
     del_op->params.obj_owner = bowner;
     del_op->params.bucket_owner = bucket_owner.id;
+    rgw::cloud_delete::maybe_set_check_objv(cloud_ctx,
+                                            &del_op->params.check_objv);
 
     ret = del_op->delete_obj(dpp, y, rgw::sal::FLAG_LOG_OP);
+    bool delete_succeeded = (ret >= 0);
     if (ret < 0) {
       goto delop_fail;
     }
+
+    rgw::cloud_delete::maybe_enqueue_after_delete(
+        dpp, driver, cloud_ctx, del_op->result.version_id,
+        delete_succeeded, del_op->result.delete_marker, y);
   } else { // bucket deletion
     if (!driver->is_meta_master()) {
       // apply bucket deletion on the master zone first

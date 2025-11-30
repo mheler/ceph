@@ -498,6 +498,16 @@ rgw::restore::Restore* FilterDriver::get_rgwrestore()
   return next->get_rgwrestore();
 }
 
+rgw::cloud_delete::CloudDelete* FilterDriver::get_rgwcloud_delete()
+{
+  return next->get_rgwcloud_delete();
+}
+
+std::unique_ptr<CloudDelete> FilterDriver::get_cloud_delete()
+{
+  return next->get_cloud_delete();
+}
+
 RGWCoroutinesManagerRegistry* FilterDriver::get_cr_registry()
 {
   return next->get_cr_registry();

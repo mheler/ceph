@@ -152,6 +152,25 @@ For example, to enable per-bucket targeting with a custom prefix:
                                               --storage-class CLOUDTIER \
                                               --tier-config=target_by_bucket=true,\
                                               target_by_bucket_prefix=archive-${owner}-${bucket}
+* ``delete_with_head_object`` (boolean)
+
+  When set to ``true``, deleting a cloud-transitioned object also issues an
+  asynchronous delete of the corresponding object on the cloud target. This
+  option implies ``retain_head_object = true``. Delete marker creation on a
+  versioned bucket does not trigger a cloud delete. Only explicit version
+  deletes (including lifecycle expirations of specific versions) enqueue
+  a cloud delete.
+
+  .. note::
+     Versioned buckets: delete markers are ignored. Only deleting a specific
+     version (including lifecycle expiration of that version) removes the
+     remote copy.
+
+  .. note::
+     For objects transitioned before this flag was encoded in manifests, RGW
+     falls back to the current placement’s setting. Enabling this option on
+     a placement will therefore apply to previously transitioned objects as
+     well.
 
 * ``location_constraint`` (string)
 

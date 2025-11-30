@@ -476,6 +476,13 @@ public:
   virtual ~StoreRestore() = default;
 };
 
+class StoreCloudDelete : public CloudDelete {
+
+public:
+  StoreCloudDelete() = default;
+  virtual ~StoreCloudDelete() = default;
+};
+
 class StoreNotification : public Notification {
 protected:
   Object* obj;

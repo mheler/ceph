@@ -70,6 +70,7 @@
 #include "rgw_bucket_logging.h"
 #include "rgw_restore.h"
 #include "rgw_restore_waiter.h"
+#include "rgw_cloud_delete.h"
 
 #include "services/svc_zone.h"
 #include "services/svc_quota.h"
@@ -5713,6 +5714,8 @@ void RGWDeleteObj::execute(optional_yield y)
     uint64_t obj_size = 0;
     std::string etag;
     bool null_verid;
+    bool is_current_version = s->object->get_instance().empty();
+    rgw::cloud_delete::CloudDeleteContext cloud_ctx;
     {
       int state_loaded = -1;
       bool check_obj_lock = s->object->have_instance() && s->bucket->get_info().obj_lock_enabled();
@@ -5735,7 +5738,11 @@ void RGWDeleteObj::execute(optional_yield y)
         }
       } else {
         obj_size = s->object->get_size();
-        etag = s->object->get_attrs()[RGW_ATTR_ETAG].to_str();
+        auto& attrs = s->object->get_attrs();
+        etag = attrs[RGW_ATTR_ETAG].to_str();
+        bool is_versioned_delete_marker = s->bucket->versioning_enabled() && s->object->get_instance().empty();
+        cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+            this, driver, s->object.get(), is_versioned_delete_marker, s->yield, &attrs);
       }
 
       // ignore return value from get_obj_attrs in all other cases
@@ -5818,6 +5825,9 @@ void RGWDeleteObj::execute(optional_yield y)
       del_op->params.null_verid = null_verid;
       del_op->params.size_match = size_match;
       del_op->params.if_match = if_match;
+      if (cloud_ctx.check_objv) {
+        del_op->params.check_objv = &cloud_ctx.check_objv.value();
+      }
 
       op_ret = del_op->delete_obj(this, y, rgw::sal::FLAG_LOG_OP);
       if (op_ret >= 0) {
@@ -5861,6 +5871,12 @@ void RGWDeleteObj::execute(optional_yield y)
     if (ret < 0) {
       ldpp_dout(this, 1) << "ERROR: publishing notification failed, with error: " << ret << dendl;
       // too late to rollback operation, hence op_ret is not set here
+    }
+    if (op_ret >= 0 && !ver_restored) {
+      // Best-effort: don't fail user delete if cloud enqueue fails
+      rgw::cloud_delete::try_enqueue_after_delete(this, driver, cloud_ctx,
+          s->bucket->get_key(), s->object->get_key(), version_id,
+          is_current_version, y);
     }
   } else {
     op_ret = -EINVAL;
@@ -7740,6 +7756,8 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
 
   uint64_t obj_size = 0;
   std::string etag;
+  rgw::cloud_delete::CloudDeleteContext cloud_ctx;
+  bool is_current_version = object.get_version_id().empty();
 
   if (!rgw::sal::Object::empty(obj.get())) {
     int state_loaded = -1;
@@ -7757,7 +7775,11 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
       }
     } else {
       obj_size = obj->get_size();
-      etag = obj->get_attrs()[RGW_ATTR_ETAG].to_str();
+      auto& attrs = obj->get_attrs();
+      etag = attrs[RGW_ATTR_ETAG].to_str();
+      bool is_versioned_delete_marker = s->bucket->versioning_enabled() && object.get_version_id().empty();
+      cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+          dpp, driver, obj.get(), is_versioned_delete_marker, y, &attrs);
     }
 
     if (check_obj_lock) {
@@ -7794,6 +7816,9 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   del_op->params.last_mod_time_match = object.get_last_mod_time();
   del_op->params.if_match = object.get_if_match();
   del_op->params.size_match = object.get_size_match();
+  if (cloud_ctx.check_objv) {
+    del_op->params.check_objv = &cloud_ctx.check_objv.value();
+  }
 
   op_ret = del_op->delete_obj(dpp, y,
                               rgw::sal::FLAG_LOG_OP | (skip_olh_obj_update ? rgw::sal::FLAG_SKIP_UPDATE_OLH : 0));
@@ -7816,6 +7841,12 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   }
   
   send_partial_response(o, del_op->result.delete_marker, del_op->result.version_id, op_ret);
+
+  if (op_ret >= 0 && !del_op->result.delete_marker) {
+    rgw::cloud_delete::try_enqueue_after_delete(dpp, driver, cloud_ctx,
+        s->bucket->get_key(), obj->get_key(), del_op->result.version_id,
+        is_current_version, y);
+  }
 }
 
 void RGWDeleteMultiObj::handle_versioned_objects(const std::vector<RGWMultiDelObject>& objects,

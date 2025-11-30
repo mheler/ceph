@@ -501,6 +501,7 @@ struct RGWZoneGroupPlacementTierS3 {
   std::string target_path;
   bool target_by_bucket{false};
   std::string target_by_bucket_prefix;
+  bool delete_with_head_object{false};
   std::map<std::string, RGWTierACLMapping> acl_mappings;
 
   uint64_t multipart_sync_threshold{DEFAULT_MULTIPART_SYNC_PART_SIZE};
@@ -515,7 +516,7 @@ struct RGWZoneGroupPlacementTierS3 {
                                       const std::string& owner = {}) const;
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(3, 1, bl);
+    ENCODE_START(4, 1, bl);
     encode(endpoint, bl);
     encode(key, bl);
     encode(region, bl);
@@ -524,6 +525,7 @@ struct RGWZoneGroupPlacementTierS3 {
     encode(target_path, bl);
     encode(target_by_bucket, bl);
     encode(target_by_bucket_prefix, bl);
+    encode(delete_with_head_object, bl);
     encode(acl_mappings, bl);
     encode(multipart_sync_threshold, bl);
     encode(multipart_min_part_size, bl);
@@ -532,7 +534,7 @@ struct RGWZoneGroupPlacementTierS3 {
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(3, bl);
+    DECODE_START(4, bl);
     decode(endpoint, bl);
     decode(key, bl);
     decode(region, bl);
@@ -546,6 +548,9 @@ struct RGWZoneGroupPlacementTierS3 {
     if (struct_v >= 3) {
       decode(target_by_bucket, bl);
       decode(target_by_bucket_prefix, bl);
+    }
+    if (struct_v >= 4) {
+      decode(delete_with_head_object, bl);
     }
     decode(acl_mappings, bl);
     decode(multipart_sync_threshold, bl);

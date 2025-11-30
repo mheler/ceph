@@ -29,6 +29,7 @@
 #include "rgw_bucket.h"
 #include "rgw_bucket_layout.h"
 #include "rgw_lc.h"
+#include "rgw_cloud_delete.h"
 #include "rgw_string.h"
 #include "rgw_sal.h"
 #include "rgw_multipart_meta_filter.h"
@@ -655,11 +656,11 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
     }
   }
 
+  auto& attrs = obj->get_attrs();
   auto have_notify = !event_types.empty();
   if (have_notify) {
-    auto attrset = obj->get_attrs();
-    auto iter = attrset.find(RGW_ATTR_ETAG);
-    if (iter != attrset.end()) {
+    auto iter = attrs.find(RGW_ATTR_ETAG);
+    if (iter != attrs.end()) {
       etag = rgw_bl_str(iter->second);
     }
   }
@@ -674,6 +675,17 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   del_op->params.bucket_owner = bucket_info.owner;
   del_op->params.unmod_since = meta.mtime;
 
+  rgw::cloud_delete::CloudDeleteContext cloud_ctx;
+  bool is_current_version = oc.o.is_current();
+  if (remove_indeed) {
+    const rgw::sal::Attrs* attrs_for_cloud = (ret >= 0 ? &attrs : nullptr);
+    cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+        dpp, driver, obj.get(), false, y, attrs_for_cloud);
+    if (cloud_ctx.check_objv) {
+      del_op->params.check_objv = &cloud_ctx.check_objv.value();
+    }
+  }
+
   uint32_t flags = (!remove_indeed || !zonegroup_lc_check(dpp, oc.driver->get_zone()))
                    ? rgw::sal::FLAG_LOG_OP : 0;
   ret =  del_op->delete_obj(dpp, y, flags);
@@ -684,6 +696,12 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
     if (have_notify) {
       send_notification(dpp, y, driver, obj.get(), oc.bucket, etag, size,
 			version_id, event_types);
+    }
+
+    if (remove_indeed) {
+      rgw::cloud_delete::try_enqueue_after_delete(dpp, driver, cloud_ctx,
+          oc.bucket->get_key(), obj->get_key(), del_op->result.version_id,
+          is_current_version, y);
     }
   }
 

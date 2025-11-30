@@ -2054,9 +2054,14 @@ std::unique_ptr<Lifecycle> RadosStore::get_lifecycle(void)
   return std::make_unique<RadosLifecycle>(this);
 }
 
-std::unique_ptr<Restore> RadosStore::get_restore(void)	
+std::unique_ptr<Restore> RadosStore::get_restore(void)
 {
   return std::make_unique<RadosRestore>(this);
+}
+
+std::unique_ptr<CloudDelete> RadosStore::get_cloud_delete(void)
+{
+  return std::make_unique<RadosCloudDelete>(this);
 }
 
 bool RadosStore::process_expired_objects(const DoutPrefixProvider *dpp,
@@ -3649,7 +3654,9 @@ int RadosObject::RadosDeleteOp::delete_obj(const DoutPrefixProvider* dpp, option
   parent_op.params.abortmp = params.abortmp;
   parent_op.params.parts_accounted_size = params.parts_accounted_size;
   parent_op.params.null_verid = params.null_verid;
-  if (params.objv_tracker) {
+  if (params.check_objv) {
+      parent_op.params.check_objv = params.check_objv;
+  } else if (params.objv_tracker) {
       parent_op.params.check_objv = params.objv_tracker->version_for_check();
   }
 
@@ -3670,6 +3677,10 @@ int RadosObject::delete_object(const DoutPrefixProvider* dpp,
 			       std::list<rgw_obj_index_key>* remove_objs,
 			       RGWObjVersionTracker* objv)
 {
+  // Read attrs for cloud-delete; version tracker prevents TOCTOU races
+  auto cloud_ctx = rgw::cloud_delete::prepare_cloud_delete_context(
+      dpp, store, this, false, y);
+
   RGWRados::Object del_target(store->getRados(), bucket->get_info(), *rados_ctx, get_obj());
   RGWRados::Object::Delete del_op(&del_target);
 
@@ -3680,11 +3691,20 @@ int RadosObject::delete_object(const DoutPrefixProvider* dpp,
     : bucket->get_info().versioning_status();
   del_op.params.remove_objs = remove_objs;
   if (objv) {
-      del_op.params.check_objv = objv->version_for_check();
+    del_op.params.check_objv = objv->version_for_check();
+  } else if (cloud_ctx.check_objv) {
+    del_op.params.check_objv = &cloud_ctx.check_objv.value();
   }
 
   // convert flags to bool params
-  return del_op.delete_obj(y, dpp, flags & FLAG_LOG_OP, flags & FLAG_FORCE_OP, flags & FLAG_SKIP_UPDATE_OLH);
+  int ret = del_op.delete_obj(y, dpp, flags & FLAG_LOG_OP, flags & FLAG_FORCE_OP, flags & FLAG_SKIP_UPDATE_OLH);
+  if (ret >= 0 && cloud_ctx.attrs.has_value() && !del_op.result.delete_marker) {
+    bool is_current_version = get_key().instance.empty();
+    rgw::cloud_delete::maybe_enqueue_cloud_delete(dpp, store, *cloud_ctx.attrs,
+        bucket->get_key(), get_key(), del_op.result.version_id,
+        is_current_version, y);
+  }
+  return ret;
 } // RadosObject::delete_object
 
 int RadosObject::copy_object(const ACLOwner& owner,
@@ -4950,6 +4970,135 @@ int RadosRestore::trim(const DoutPrefixProvider *dpp, optional_yield y,
     ldpp_dout(dpp, -1) << __PRETTY_FUNCTION__
 		 << ": unable to trim FIFO: " << obj_names[index]
 		 << ": " << e.what() << dendl;
+    return ceph::from_error_code(e.code());
+  }
+  return 0;
+}
+
+// RadosCloudDelete implementation
+
+RadosCloudDelete::RadosCloudDelete(RadosStore* _st) : store(_st),
+	r(store->get_neorados()),
+	neo_ioctx(*store->getRados()->get_cloud_delete_pool_neo_ctx()) {}
+
+RadosCloudDelete::~RadosCloudDelete() {
+  obj_names.clear();
+  fifos.clear();
+}
+
+int RadosCloudDelete::initialize(const DoutPrefixProvider* dpp, optional_yield y,
+                                  int n_objs, std::vector<std::string>& o_names)
+{
+  num_objs = n_objs;
+  obj_names = o_names;
+
+  maybe_warn_about_blocking(dpp);
+  for (int i = 0; i < num_objs; i++) {
+    std::unique_ptr<fifo::FIFO> fifo_tmp;
+    try {
+      fifo_tmp = fifo::FIFO::create(dpp, r, obj_names[i], neo_ioctx, ceph::async::use_blocked);
+    } catch (const sys::system_error& e) {
+      ldpp_dout(dpp, -1) << "creating cloud delete fifo for index=" << i
+           << ", objname=" << obj_names[i] << " failed: " << e.what() << dendl;
+      return ceph::from_error_code(e.code());
+    }
+
+    if (!fifo_tmp) {
+      return -ENOMEM;
+    }
+    ldpp_dout(dpp, 20) << "created cloud delete fifo for index=" << i
+           << ", objname=" << obj_names[i] << dendl;
+
+    fifos.push_back(std::move(fifo_tmp));
+  }
+
+  return 0;
+}
+
+int RadosCloudDelete::enqueue(const DoutPrefixProvider* dpp, optional_yield y,
+                               const rgw::cloud_delete::CloudDeleteEntry& entry)
+{
+  if (!num_objs) return -EINVAL;
+
+  // Hash to determine shard
+  size_t hash = ceph_str_hash_linux(entry.src_bucket.name.data(), entry.src_bucket.name.size());
+  hash ^= ceph_str_hash_linux(entry.src_key.name.data(), entry.src_key.name.size());
+  if (!entry.src_key.instance.empty()) {
+    hash ^= ceph_str_hash_linux(entry.src_key.instance.data(), entry.src_key.instance.size());
+  }
+  int shard = static_cast<int>(hash % num_objs);
+
+  ceph::buffer::list bl;
+  encode(entry, bl);
+
+  ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__
+         << " Enqueuing cloud delete entry to shard " << shard << dendl;
+
+  maybe_warn_about_blocking(dpp);
+  try {
+    fifos[shard]->push(dpp, std::move(bl), ceph::async::use_blocked);
+  } catch (const sys::system_error& e) {
+    ldpp_dout(dpp, -1) << "push to cloud delete FIFO[" << obj_names[shard]
+                       << "] failed: " << e.what() << dendl;
+    return ceph::from_error_code(e.code());
+  }
+
+  return 0;
+}
+
+int RadosCloudDelete::list_entries(const DoutPrefixProvider* dpp, optional_yield y,
+                                    int index, const std::string& marker,
+                                    std::string* out_marker, uint32_t max_entries,
+                                    std::vector<rgw::cloud_delete::CloudDeleteEntry>& entries,
+                                    bool* truncated)
+{
+  std::vector<fifo::entry> fifo_entries{max_entries};
+  std::string omark;
+  bool more = false;
+
+  maybe_warn_about_blocking(dpp);
+  try {
+    auto [lentries, lmark] = fifos[index]->list(dpp, marker, fifo_entries, ceph::async::use_blocked);
+    entries.clear();
+    for (const auto& e : lentries) {
+      auto& dec = entries.emplace_back();
+      auto iter = e.data.cbegin();
+      decode(dec, iter);
+      omark = e.marker;
+    }
+    more = !lmark.empty();
+  } catch (const sys::system_error& e) {
+    if (e.code() != std::errc::no_such_file_or_directory) {
+      ldpp_dout(dpp, -1) << __PRETTY_FUNCTION__
+                         << ": unable to list cloud delete FIFO: " << obj_names[index]
+                         << ": " << e.what() << dendl;
+      return ceph::from_error_code(e.code());
+    }
+  }
+
+  if (out_marker) {
+    *out_marker = omark;
+  }
+  if (truncated) {
+    *truncated = more;
+  }
+  return 0;
+}
+
+int RadosCloudDelete::trim_entries(const DoutPrefixProvider* dpp, optional_yield y,
+                                    int index, const std::string& marker)
+{
+  ldpp_dout(dpp, 20) << __PRETTY_FUNCTION__
+         << " Trimming cloud delete FIFO:" << obj_names[index]
+         << " up to marker:" << marker << dendl;
+
+  maybe_warn_about_blocking(dpp);
+  try {
+    fifos[index]->trim(dpp, marker, false, ceph::async::use_blocked);
+  } catch (const sys::system_error& e) {
+    ldpp_dout(dpp, -1) << __PRETTY_FUNCTION__
+           << ": unable to trim cloud delete FIFO: " << obj_names[index]
+           << ": " << e.what() << dendl;
     return ceph::from_error_code(e.code());
   }
   return 0;

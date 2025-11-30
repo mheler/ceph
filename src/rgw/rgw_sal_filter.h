@@ -34,6 +34,7 @@ public:
   virtual bool retain_head_object() override { return next->retain_head_object(); }
   virtual bool allow_read_through() { return next->allow_read_through(); }
   virtual uint64_t get_read_through_restore_days() { return next->get_read_through_restore_days(); }
+  virtual bool delete_with_head_object() { return next->delete_with_head_object(); }
 
   /* Internal to Filters */
   PlacementTier* get_next() { return next.get(); }
@@ -293,6 +294,7 @@ public:
   virtual int cluster_stat(RGWClusterStat& stats) override;
   virtual std::unique_ptr<Lifecycle> get_lifecycle(void) override;
   virtual std::unique_ptr<Restore> get_restore(void) override;
+  virtual std::unique_ptr<CloudDelete> get_cloud_delete(void) override;
   virtual bool process_expired_objects(const DoutPrefixProvider *dpp, optional_yield y) override;
 
   virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj,
@@ -385,6 +387,7 @@ public:
   }
   virtual RGWLC* get_rgwlc(void) override;
   virtual rgw::restore::Restore* get_rgwrestore(void) override;
+  virtual rgw::cloud_delete::CloudDelete* get_rgwcloud_delete(void) override;
   virtual RGWCoroutinesManagerRegistry* get_cr_registry() override;
 
   virtual int log_usage(const DoutPrefixProvider *dpp, std::map<rgw_user_bucket,

@@ -43,6 +43,7 @@ struct RGWZoneParams {
   JSONFormattable tier_config;
 
   rgw_pool restore_pool;
+  rgw_pool cloud_delete_pool;
 
   RGWZoneParams() {}
   explicit RGWZoneParams(const std::string& _name) : name(_name){}
@@ -62,7 +63,7 @@ struct RGWZoneParams {
   const std::string& get_compression_type(const rgw_placement_rule& placement_rule) const;
   
   void encode(bufferlist& bl) const {
-    ENCODE_START(17, 1, bl);
+    ENCODE_START(18, 1, bl);
     encode(domain_root, bl);
     encode(control_pool, bl);
     encode(gc_pool, bl);
@@ -100,11 +101,12 @@ struct RGWZoneParams {
     encode(group_pool, bl);
     encode(restore_pool, bl);
     encode(dedup_pool, bl);
+    encode(cloud_delete_pool, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(17, bl);
+    DECODE_START(18, bl);
     decode(domain_root, bl);
     decode(control_pool, bl);
     decode(gc_pool, bl);
@@ -198,6 +200,11 @@ struct RGWZoneParams {
       decode(dedup_pool, bl);
     } else {
       dedup_pool = name + ".rgw.dedup";
+    }
+    if (struct_v >= 18) {
+      decode(cloud_delete_pool, bl);
+    } else {
+      cloud_delete_pool = log_pool.name + ":cloud-delete";
     }
     DECODE_FINISH(bl);
   }

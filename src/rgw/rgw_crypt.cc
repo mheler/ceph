@@ -639,6 +639,333 @@ const uint8_t AES_256_CBC::IV[AES_256_CBC::AES_256_IVSIZE] =
     { 'a', 'e', 's', '2', '5', '6', 'i', 'v', '_', 'c', 't', 'r', '1', '3', '3', '7' };
 
 
+/**
+ * AES-256-GCM encryption implementation
+ * Provides authenticated encryption with 96-bit IVs and 128-bit authentication tags
+ */
+class AES_256_GCM : public BlockCrypt {
+public:
+  static const size_t AES_256_KEYSIZE = 256 / 8;        // 32 bytes
+  static const size_t AES_256_IVSIZE = 96 / 8;          // 12 bytes (GCM standard)
+  static const size_t GCM_TAG_SIZE = 128 / 8;           // 16 bytes
+  static const size_t CHUNK_SIZE = 4096;
+  static const size_t ENCRYPTED_CHUNK_SIZE = CHUNK_SIZE + GCM_TAG_SIZE; // 4112
+
+  const DoutPrefixProvider* dpp;
+private:
+  static const uint8_t IV[AES_256_IVSIZE];
+  CephContext* cct;
+  uint8_t key[AES_256_KEYSIZE];
+
+public:
+  explicit AES_256_GCM(const DoutPrefixProvider* dpp, CephContext* cct)
+    : dpp(dpp), cct(cct) {
+  }
+
+  ~AES_256_GCM() {
+    ::ceph::crypto::zeroize_for_security(key, AES_256_KEYSIZE);
+  }
+
+  bool set_key(const uint8_t* _key, size_t key_size) {
+    if (key_size != AES_256_KEYSIZE) {
+      return false;
+    }
+    memcpy(key, _key, AES_256_KEYSIZE);
+    return true;
+  }
+
+  size_t get_block_size() override {
+    return CHUNK_SIZE;
+  }
+
+  size_t get_encrypted_block_size() override {
+    return ENCRYPTED_CHUNK_SIZE;
+  }
+
+  bool gcm_encrypt_chunk(unsigned char* out,
+                         const unsigned char* in,
+                         size_t size,
+                         const unsigned char (&iv)[AES_256_IVSIZE],
+                         const unsigned char (&key)[AES_256_KEYSIZE],
+                         unsigned char* tag)
+  {
+    using pctx_t = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>;
+    pctx_t pctx{ EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free };
+
+    if (!pctx) {
+      ldpp_dout(dpp, 5) << "EVP: failed to create cipher context" << dendl;
+      return false;
+    }
+
+    // 1st init: set cipher type
+    if (1 != EVP_EncryptInit_ex(pctx.get(), EVP_aes_256_gcm(),
+                                 nullptr, nullptr, nullptr)) {
+      ldpp_dout(dpp, 5) << "EVP: failed to initialize GCM" << dendl;
+      return false;
+    }
+
+    // Verify IV size (should be 12 bytes for GCM)
+    if (EVP_CIPHER_CTX_iv_length(pctx.get()) != AES_256_IVSIZE) {
+      ldpp_dout(dpp, 5) << "EVP: unexpected IV length "
+                        << EVP_CIPHER_CTX_iv_length(pctx.get())
+                        << " expected " << AES_256_IVSIZE << dendl;
+      return false;
+    }
+
+    // 2nd init: set key and IV
+    if (1 != EVP_EncryptInit_ex(pctx.get(), nullptr, nullptr, key, iv)) {
+      ldpp_dout(dpp, 5) << "EVP: failed to set key/IV" << dendl;
+      return false;
+    }
+
+    // Encrypt data
+    int written = 0;
+    ceph_assert(size <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    if (1 != EVP_EncryptUpdate(pctx.get(), out, &written, in, size)) {
+      ldpp_dout(dpp, 5) << "EVP: EncryptUpdate failed" << dendl;
+      return false;
+    }
+
+    // Finalize (GCM doesn't add padding, so finally_written should be 0)
+    int finally_written = 0;
+    if (1 != EVP_EncryptFinal_ex(pctx.get(), out + written, &finally_written)) {
+      ldpp_dout(dpp, 5) << "EVP: EncryptFinal_ex failed" << dendl;
+      return false;
+    }
+
+    // Get authentication tag
+    if (1 != EVP_CIPHER_CTX_ctrl(pctx.get(), EVP_CTRL_GCM_GET_TAG,
+                                  GCM_TAG_SIZE, tag)) {
+      ldpp_dout(dpp, 5) << "EVP: failed to get GCM tag" << dendl;
+      return false;
+    }
+
+    return (written + finally_written) == static_cast<int>(size);
+  }
+
+  bool gcm_decrypt_chunk(unsigned char* out,
+                         const unsigned char* in,
+                         size_t size,
+                         const unsigned char (&iv)[AES_256_IVSIZE],
+                         const unsigned char (&key)[AES_256_KEYSIZE],
+                         const unsigned char* tag)
+  {
+    using pctx_t = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>;
+    pctx_t pctx{ EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free };
+
+    if (!pctx) {
+      ldpp_dout(dpp, 5) << "EVP: failed to create cipher context" << dendl;
+      return false;
+    }
+
+    // 1st init: set cipher type
+    if (1 != EVP_DecryptInit_ex(pctx.get(), EVP_aes_256_gcm(),
+                                 nullptr, nullptr, nullptr)) {
+      ldpp_dout(dpp, 5) << "EVP: failed to initialize GCM" << dendl;
+      return false;
+    }
+
+    // 2nd init: set key and IV
+    if (1 != EVP_DecryptInit_ex(pctx.get(), nullptr, nullptr, key, iv)) {
+      ldpp_dout(dpp, 5) << "EVP: failed to set key/IV" << dendl;
+      return false;
+    }
+
+    // Decrypt data
+    int written = 0;
+    ceph_assert(size <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    if (1 != EVP_DecryptUpdate(pctx.get(), out, &written, in, size)) {
+      ldpp_dout(dpp, 5) << "EVP: DecryptUpdate failed" << dendl;
+      return false;
+    }
+
+    // Set expected tag for verification
+    if (1 != EVP_CIPHER_CTX_ctrl(pctx.get(), EVP_CTRL_GCM_SET_TAG,
+                                  GCM_TAG_SIZE, const_cast<unsigned char*>(tag))) {
+      ldpp_dout(dpp, 5) << "EVP: failed to set GCM tag" << dendl;
+      return false;
+    }
+
+    // Finalize - this verifies the tag
+    int finally_written = 0;
+    if (1 != EVP_DecryptFinal_ex(pctx.get(), out + written, &finally_written)) {
+      ldpp_dout(dpp, 5) << "EVP: DecryptFinal_ex failed - authentication failure" << dendl;
+      return false;  // Tag verification failed
+    }
+
+    return (written + finally_written) == static_cast<int>(size);
+  }
+
+  bool encrypt(bufferlist& input,
+               off_t in_ofs,
+               size_t size,
+               bufferlist& output,
+               off_t stream_offset,
+               optional_yield y) override
+  {
+    output.clear();
+
+    // Calculate output size: each CHUNK_SIZE plaintext becomes CHUNK_SIZE + GCM_TAG_SIZE
+    size_t num_full_chunks = size / CHUNK_SIZE;
+    size_t remainder = size % CHUNK_SIZE;
+    size_t output_size = num_full_chunks * ENCRYPTED_CHUNK_SIZE;
+    if (remainder > 0) {
+      output_size += remainder + GCM_TAG_SIZE;
+    }
+
+    buffer::ptr buf(output_size);
+    unsigned char* buf_raw = reinterpret_cast<unsigned char*>(buf.c_str());
+    const unsigned char* input_raw = reinterpret_cast<const unsigned char*>(
+        input.c_str() + in_ofs);
+
+    size_t out_pos = 0;
+
+    // Process full chunks
+    for (size_t offset = 0; offset < num_full_chunks * CHUNK_SIZE; offset += CHUNK_SIZE) {
+      unsigned char iv[AES_256_IVSIZE];
+      prepare_iv(iv, stream_offset + offset);
+
+      unsigned char* ciphertext = buf_raw + out_pos;
+      unsigned char* tag = buf_raw + out_pos + CHUNK_SIZE;
+
+      if (!gcm_encrypt_chunk(ciphertext, input_raw + offset, CHUNK_SIZE,
+                             iv, key, tag)) {
+        ldpp_dout(dpp, 5) << "Failed to encrypt chunk at offset " << offset << dendl;
+        return false;
+      }
+
+      out_pos += ENCRYPTED_CHUNK_SIZE;
+    }
+
+    // Process remainder (if any)
+    if (remainder > 0) {
+      unsigned char iv[AES_256_IVSIZE];
+      prepare_iv(iv, stream_offset + num_full_chunks * CHUNK_SIZE);
+
+      unsigned char* ciphertext = buf_raw + out_pos;
+      unsigned char* tag = buf_raw + out_pos + remainder;
+
+      if (!gcm_encrypt_chunk(ciphertext, input_raw + num_full_chunks * CHUNK_SIZE,
+                             remainder, iv, key, tag)) {
+        ldpp_dout(dpp, 5) << "Failed to encrypt final chunk" << dendl;
+        return false;
+      }
+    }
+
+    ldpp_dout(dpp, 25) << "GCM: Encrypted " << size << " bytes to "
+                       << output_size << " bytes" << dendl;
+    buf.set_length(output_size);
+    output.append(buf);
+    return true;
+  }
+
+  bool decrypt(bufferlist& input,
+               off_t in_ofs,
+               size_t size,
+               bufferlist& output,
+               off_t stream_offset,
+               optional_yield y) override
+  {
+    output.clear();
+
+    // Input is organized as encrypted chunks (ciphertext + tag)
+    size_t num_full_chunks = size / ENCRYPTED_CHUNK_SIZE;
+    size_t remainder = size % ENCRYPTED_CHUNK_SIZE;
+    size_t output_size = num_full_chunks * CHUNK_SIZE;
+
+    if (remainder > 0) {
+      if (remainder <= GCM_TAG_SIZE) {
+        ldpp_dout(dpp, 5) << "GCM: Invalid encrypted data size: " << size << dendl;
+        return false;
+      }
+      output_size += remainder - GCM_TAG_SIZE;
+    }
+
+    buffer::ptr buf(output_size);
+    unsigned char* buf_raw = reinterpret_cast<unsigned char*>(buf.c_str());
+    unsigned char* input_raw = reinterpret_cast<unsigned char*>(
+        input.c_str() + in_ofs);
+
+    size_t in_pos = 0;
+    size_t out_pos = 0;
+
+    // Process full chunks
+    for (size_t i = 0; i < num_full_chunks; i++) {
+      unsigned char iv[AES_256_IVSIZE];
+      prepare_iv(iv, stream_offset + i * CHUNK_SIZE);
+
+      unsigned char* ciphertext = input_raw + in_pos;
+      unsigned char* tag = input_raw + in_pos + CHUNK_SIZE;
+
+      if (!gcm_decrypt_chunk(buf_raw + out_pos, ciphertext, CHUNK_SIZE,
+                             iv, key, tag)) {
+        ldpp_dout(dpp, 5) << "GCM: Failed to decrypt chunk " << i
+                          << " - authentication failed" << dendl;
+        return false;
+      }
+
+      in_pos += ENCRYPTED_CHUNK_SIZE;
+      out_pos += CHUNK_SIZE;
+    }
+
+    // Process remainder (if any)
+    if (remainder > 0) {
+      size_t plaintext_size = remainder - GCM_TAG_SIZE;
+      unsigned char iv[AES_256_IVSIZE];
+      prepare_iv(iv, stream_offset + num_full_chunks * CHUNK_SIZE);
+
+      unsigned char* ciphertext = input_raw + in_pos;
+      unsigned char* tag = input_raw + in_pos + plaintext_size;
+
+      if (!gcm_decrypt_chunk(buf_raw + out_pos, ciphertext, plaintext_size,
+                             iv, key, tag)) {
+        ldpp_dout(dpp, 5) << "GCM: Failed to decrypt final chunk - authentication failed" << dendl;
+        return false;
+      }
+    }
+
+    ldpp_dout(dpp, 25) << "GCM: Decrypted " << size << " bytes to "
+                       << output_size << " bytes" << dendl;
+    buf.set_length(output_size);
+    output.append(buf);
+    return true;
+  }
+
+  void prepare_iv(unsigned char (&iv)[AES_256_IVSIZE], off_t offset) {
+    // Derive IV from chunk index and base IV
+    off_t index = offset / CHUNK_SIZE;
+    off_t i = AES_256_IVSIZE - 1;
+    unsigned int val;
+    unsigned int carry = 0;
+
+    while (i >= 0) {
+      val = (index & 0xff) + IV[i] + carry;
+      iv[i] = val;
+      carry = val >> 8;
+      index = index >> 8;
+      i--;
+    }
+  }
+};
+
+
+std::unique_ptr<BlockCrypt> AES_256_GCM_create(const DoutPrefixProvider* dpp,
+                                                CephContext* cct,
+                                                const uint8_t* key,
+                                                size_t len)
+{
+  auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(dpp, cct));
+  if (!gcm->set_key(key, AES_256_GCM::AES_256_KEYSIZE)) {
+    return nullptr;
+  }
+  return gcm;
+}
+
+
+const uint8_t AES_256_GCM::IV[AES_256_GCM::AES_256_IVSIZE] =
+    { 'a', 'e', 's', '2', '5', '6', 'g', 'c', 'm', 'i', 'v', '0' };
+
+
 bool AES_256_ECB_encrypt(const DoutPrefixProvider* dpp,
                          CephContext* cct,
                          const uint8_t* key,
@@ -1119,11 +1446,11 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return -EINVAL;
       }
 
-      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-C-AES256");
+      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-C-AES256-GCM");
       set_attr(attrs, RGW_ATTR_CRYPT_KEYMD5, keymd5_bin);
 
       if (block_crypt) {
-        auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+        auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
         aes->set_key(reinterpret_cast<const uint8_t*>(key_bin.c_str()), AES_256_KEYSIZE);
         *block_crypt = std::move(aes);
       }
@@ -1185,7 +1512,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
           std::string key_selector = create_random_key_selector(s->cct);
           set_attr(attrs, RGW_ATTR_CRYPT_KEYSEL, key_selector);
         }
-        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-KMS");
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-KMS-GCM");
         set_attr(attrs, RGW_ATTR_CRYPT_KEYID, key_id);
         set_attr(attrs, RGW_ATTR_CRYPT_CONTEXT, cooked_context);
         std::string actual_key;
@@ -1203,7 +1530,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         }
 
         if (block_crypt) {
-          auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+          auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
           aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
           *block_crypt = std::move(aes);
         }
@@ -1241,7 +1568,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
       }
 
       set_attr(attrs, RGW_ATTR_CRYPT_CONTEXT, cooked_context);
-      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "AES256");
+      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "AES256-GCM");
       set_attr(attrs, RGW_ATTR_CRYPT_KEYID, key_id);
       std::string actual_key;
       res = make_actual_key_from_sse_s3(s, attrs, y, actual_key);
@@ -1258,7 +1585,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
       }
 
       if (block_crypt) {
-        auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+        auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
         aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
         *block_crypt = std::move(aes);
       }
@@ -1286,7 +1613,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return 0;
       }
 
-      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "RGW-AUTO");
+      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "RGW-AUTO-GCM");
       std::string key_selector = create_random_key_selector(s->cct);
       set_attr(attrs, RGW_ATTR_CRYPT_KEYSEL, key_selector);
 
@@ -1299,7 +1626,7 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return -EIO;
       }
       if (block_crypt) {
-        auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+        auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
         aes->set_key(reinterpret_cast<const uint8_t*>(actual_key), AES_256_KEYSIZE);
         *block_crypt = std::move(aes);
       }
@@ -1416,6 +1743,96 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
     return 0;
   }
 
+  if (stored_mode == "SSE-C-AES256-GCM") {
+    if (s->cct->_conf->rgw_crypt_require_ssl &&
+        !rgw_transport_is_secure(s->cct, *s->info.env)) {
+      ldpp_dout(s, 5) << "ERROR: Insecure request, rgw_crypt_require_ssl is set" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+
+    const char *sse_c_algo_hdr = copy_source ? "HTTP_X_AMZ_COPY_SOURCE_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM" :
+                                               "HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM";
+    const char *req_cust_alg = s->info.env->get(sse_c_algo_hdr, NULL);
+    if (nullptr == req_cust_alg)  {
+      ldpp_dout(s, 5) << "ERROR: Request for SSE-C encrypted object missing "
+                       << "x-amz-server-side-encryption-customer-algorithm"
+                       << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide a valid encryption algorithm.";
+      return -EINVAL;
+    } else if (strcmp(req_cust_alg, "AES256") != 0) {
+      ldpp_dout(s, 5) << "ERROR: The requested encryption algorithm is not valid, must be AES256." << dendl;
+      s->err.message = "The requested encryption algorithm is not valid, must be AES256.";
+      return -ERR_INVALID_ENCRYPTION_ALGORITHM;
+    }
+
+    const char *sse_c_key_hdr = copy_source ? "HTTP_X_AMZ_COPY_SOURCE_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY" :
+                                              "HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY";
+    std::string key_bin;
+    try {
+      key_bin = from_base64(s->info.env->get(sse_c_key_hdr, ""));
+    } catch (...) {
+      ldpp_dout(s, 5) << "ERROR: rgw_s3_prepare_decrypt invalid encryption key "
+                       << "which contains character that is not base64 encoded."
+                       << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key.";
+      return -EINVAL;
+    }
+
+    if (key_bin.size() != AES_256_KEYSIZE) {
+      ldpp_dout(s, 5) << "ERROR: Invalid encryption key size" << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key.";
+      return -EINVAL;
+    }
+
+    const char *sse_c_key_md5_hdr = copy_source ? "HTTP_X_AMZ_COPY_SOURCE_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5" :
+                                                  "HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5";
+    std::string keymd5 = s->info.env->get(sse_c_key_md5_hdr, "");
+    std::string keymd5_bin;
+    try {
+      keymd5_bin = from_base64(keymd5);
+    } catch (...) {
+      ldpp_dout(s, 5) << "ERROR: rgw_s3_prepare_decrypt invalid encryption key md5 "
+                       << "which contains character that is not base64 encoded."
+                       << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key md5.";
+      return -EINVAL;
+    }
+
+    if (keymd5_bin.size() != CEPH_CRYPTO_MD5_DIGESTSIZE) {
+      ldpp_dout(s, 5) << "ERROR: Invalid key md5 size " << dendl;
+      s->err.message = "Requests specifying Server Side Encryption with Customer "
+                       "provided keys must provide an appropriate secret key md5.";
+      return -EINVAL;
+    }
+
+    MD5 key_hash;
+    // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+    key_hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+    uint8_t key_hash_res[CEPH_CRYPTO_MD5_DIGESTSIZE];
+    key_hash.Update(reinterpret_cast<const unsigned char*>(key_bin.c_str()), key_bin.size());
+    key_hash.Final(key_hash_res);
+
+    if ((memcmp(key_hash_res, keymd5_bin.c_str(), CEPH_CRYPTO_MD5_DIGESTSIZE) != 0) ||
+        (get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYMD5) != keymd5_bin)) {
+      s->err.message = "The calculated MD5 hash of the key did not match the hash that was provided.";
+      return -EINVAL;
+    }
+    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
+    aes->set_key(reinterpret_cast<const uint8_t*>(key_bin.c_str()), AES_256_KEYSIZE);
+    if (block_crypt) *block_crypt = std::move(aes);
+
+    if (crypt_http_responses) {
+      crypt_http_responses->emplace("x-amz-server-side-encryption-customer-algorithm", "AES256");
+      crypt_http_responses->emplace("x-amz-server-side-encryption-customer-key-MD5", keymd5);
+    }
+
+    return 0;
+  }
+
   if (stored_mode == "SSE-KMS") {
     if (s->cct->_conf->rgw_crypt_require_ssl &&
         !rgw_transport_is_secure(s->cct, *s->info.env)) {
@@ -1439,6 +1856,41 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
     }
 
     auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+    aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
+    actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+    if (block_crypt) *block_crypt = std::move(aes);
+
+    if (crypt_http_responses) {
+      crypt_http_responses->emplace("x-amz-server-side-encryption", "aws:kms");
+      crypt_http_responses->emplace("x-amz-server-side-encryption-aws-kms-key-id", key_id);
+    }
+
+    return 0;
+  }
+
+  if (stored_mode == "SSE-KMS-GCM") {
+    if (s->cct->_conf->rgw_crypt_require_ssl &&
+        !rgw_transport_is_secure(s->cct, *s->info.env)) {
+      ldpp_dout(s, 5) << "ERROR: Insecure request, rgw_crypt_require_ssl is set" << dendl;
+      return -ERR_INVALID_REQUEST;
+    }
+    /* try to retrieve actual key */
+    std::string key_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
+    std::string actual_key;
+    res = reconstitute_actual_key_from_kms(s, attrs, y, actual_key);
+    if (res != 0) {
+      ldpp_dout(s, 10) << "ERROR: failed to retrieve actual key from key_id: " << key_id << dendl;
+      s->err.message = "Failed to retrieve the actual key, kms-keyid: " + key_id;
+      return res;
+    }
+    if (actual_key.size() != AES_256_KEYSIZE) {
+      ldpp_dout(s, 0) << "ERROR: key obtained from key_id:" <<
+          key_id << " is not 256 bit size" << dendl;
+      s->err.message = "KMS provided an invalid key for the given kms-keyid.";
+      return -EINVAL;
+    }
+
+    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
     aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
     actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
     if (block_crypt) *block_crypt = std::move(aes);
@@ -1488,6 +1940,43 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
     return 0;
   }
 
+  if (stored_mode == "RGW-AUTO-GCM") {
+    std::string master_encryption_key;
+    try {
+      master_encryption_key = from_base64(std::string(s->cct->_conf->rgw_crypt_default_encryption_key));
+    } catch (...) {
+      ldpp_dout(s, 5) << "ERROR: rgw_s3_prepare_decrypt invalid default encryption key "
+                       << "which contains character that is not base64 encoded."
+                       << dendl;
+      s->err.message = "The default encryption key is not valid base64.";
+      return -EINVAL;
+    }
+
+    if (master_encryption_key.size() != 256 / 8) {
+      ldpp_dout(s, 0) << "ERROR: failed to decode 'rgw crypt default encryption key' to 256 bit string" << dendl;
+      return -EIO;
+    }
+    std::string attr_key_selector = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYSEL);
+    if (attr_key_selector.size() != AES_256_KEYSIZE) {
+      ldpp_dout(s, 0) << "ERROR: missing or invalid " RGW_ATTR_CRYPT_KEYSEL << dendl;
+      return -EIO;
+    }
+    uint8_t actual_key[AES_256_KEYSIZE];
+    if (AES_256_ECB_encrypt(s, s->cct,
+                            reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()),
+                            AES_256_KEYSIZE,
+                            reinterpret_cast<const uint8_t*>(attr_key_selector.c_str()),
+                            actual_key, AES_256_KEYSIZE) != true) {
+      ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
+      return -EIO;
+    }
+    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
+    aes->set_key(actual_key, AES_256_KEYSIZE);
+    ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
+    if (block_crypt) *block_crypt = std::move(aes);
+    return 0;
+  }
+
   /* SSE-S3 */
   if (stored_mode == "AES256") {
     /* try to retrieve actual key */
@@ -1507,6 +1996,36 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
     }
 
     auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+    aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
+    actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+    if (block_crypt) *block_crypt = std::move(aes);
+
+    if (crypt_http_responses) {
+      crypt_http_responses->emplace("x-amz-server-side-encryption", "AES256");
+    }
+
+    return 0;
+  }
+
+  /* SSE-S3 with GCM */
+  if (stored_mode == "AES256-GCM") {
+    /* try to retrieve actual key */
+    std::string key_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
+    std::string actual_key;
+    res = reconstitute_actual_key_from_sse_s3(s, attrs, y, actual_key);
+    if (res != 0) {
+      ldpp_dout(s, 10) << "ERROR: failed to retrieve actual key" << dendl;
+      s->err.message = "Failed to retrieve the actual key";
+      return res;
+    }
+    if (actual_key.size() != AES_256_KEYSIZE) {
+      ldpp_dout(s, 0) << "ERROR: key obtained " <<
+          "is not 256 bit size" << dendl;
+      s->err.message = "SSE-S3 provided an invalid key for the given keyid.";
+      return -EINVAL;
+    }
+
+    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
     aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
     actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
     if (block_crypt) *block_crypt = std::move(aes);

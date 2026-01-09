@@ -39,6 +39,15 @@ public:
   virtual size_t get_block_size() = 0;
 
   /**
+   * Returns size of encrypted block (ciphertext + metadata like auth tags).
+   * For most ciphers this equals get_block_size(), but for AEAD modes like GCM
+   * it includes the authentication tag.
+   */
+  virtual size_t get_encrypted_block_size() {
+    return get_block_size();
+  }
+
+  /**
    * Encrypts data.
    * Argument \ref stream_offset shows where in generalized stream chunk is located.
    * Input for encryption is \ref input buffer, with relevant data in range <in_ofs, in_ofs+size).
@@ -89,6 +98,11 @@ bool AES_256_ECB_encrypt(const DoutPrefixProvider* dpp,
                          const uint8_t* data_in,
                          uint8_t* data_out,
                          size_t data_size);
+
+std::unique_ptr<BlockCrypt> AES_256_GCM_create(const DoutPrefixProvider* dpp,
+                                                CephContext* cct,
+                                                const uint8_t* key,
+                                                size_t len);
 
 class RGWGetObj_BlockDecrypt : public RGWGetObj_Filter {
   const DoutPrefixProvider *dpp;

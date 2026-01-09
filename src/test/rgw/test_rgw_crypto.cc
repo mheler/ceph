@@ -26,6 +26,7 @@ using namespace std;
 
 
 std::unique_ptr<BlockCrypt> AES_256_CBC_create(const DoutPrefixProvider *dpp, CephContext* cct, const uint8_t* key, size_t len);
+std::unique_ptr<BlockCrypt> AES_256_GCM_create(const DoutPrefixProvider *dpp, CephContext* cct, const uint8_t* key, size_t len);
 
 class ut_get_sink : public RGWGetObj_Filter {
   std::stringstream sink;
@@ -810,6 +811,142 @@ TEST(TestRGWCrypto, verify_Encrypt_Decrypt)
     delete[] test_in;
   }
   while (test_size < 20000);
+}
+
+
+// GCM Tests
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_identity)
+{
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  // Create some input for encryption
+  const off_t test_range = 1024*1024;
+  buffer::ptr buf(test_range);
+  char* p = buf.c_str();
+  for(size_t i = 0; i < buf.length(); i++)
+    p[i] = i + i*i + (i >> 2);
+
+  bufferlist input;
+  input.append(buf);
+
+  for (unsigned int step : {1, 2, 3, 5, 7, 11, 13, 17})
+  {
+    // Make some random key
+    uint8_t key[32];
+    for(size_t i=0;i<sizeof(key);i++)
+      key[i]=i*step;
+
+    auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+    ASSERT_NE(aes.get(), nullptr);
+
+    size_t block_size = aes->get_block_size();
+    ASSERT_EQ(block_size, 4096u);
+
+    for (size_t r = 97; r < 123 ; r++)
+    {
+      off_t begin = (r*r*r*r*r % test_range);
+      begin = begin - begin % block_size;
+      off_t end = begin + r*r*r*r*r*r*r % (test_range - begin);
+      if (r % 3)
+        end = end - end % block_size;
+      off_t offset = r*r*r*r*r*r*r*r % (1000*1000*1000);
+      offset = offset - offset % block_size;
+
+      ASSERT_EQ(begin % block_size, 0u);
+      ASSERT_LE(end, test_range);
+      ASSERT_EQ(offset % block_size, 0u);
+
+      bufferlist encrypted;
+      ASSERT_TRUE(aes->encrypt(input, begin, end - begin, encrypted, offset, null_yield));
+
+      // GCM adds 16-byte tag per 4096-byte chunk
+      size_t expected_encrypted_size = end - begin;
+      size_t num_chunks = (end - begin + block_size - 1) / block_size;
+      expected_encrypted_size += num_chunks * 16;  // 16 bytes tag per chunk
+      ASSERT_EQ(encrypted.length(), expected_encrypted_size);
+
+      bufferlist decrypted;
+      ASSERT_TRUE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, offset, null_yield));
+
+      ASSERT_EQ(decrypted.length(), end - begin);
+      ASSERT_EQ(std::string_view(input.c_str() + begin, end - begin),
+                std::string_view(decrypted.c_str(), end - begin) );
+    }
+  }
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_chunk_sizes)
+{
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  uint8_t key[32];
+  for(size_t i=0;i<sizeof(key);i++)
+    key[i]=i*3;
+
+  auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes.get(), nullptr);
+
+  // Test various sizes to verify chunk + tag handling
+  for (size_t size : {0, 1, 16, 4095, 4096, 4097, 8192, 10000})
+  {
+    buffer::ptr buf(size);
+    char* p = buf.c_str();
+    for(size_t i = 0; i < size; i++)
+      p[i] = i & 0xFF;
+
+    bufferlist input;
+    input.append(buf);
+
+    bufferlist encrypted;
+    ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+    // Calculate expected encrypted size (plaintext + tags)
+    size_t num_chunks = (size + 4095) / 4096;  // Round up
+    if (size == 0) num_chunks = 0;
+    size_t expected_size = size + (num_chunks * 16);
+    ASSERT_EQ(encrypted.length(), expected_size);
+
+    bufferlist decrypted;
+    ASSERT_TRUE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+    ASSERT_EQ(decrypted.length(), size);
+
+    if (size > 0) {
+      ASSERT_EQ(std::string_view(input.c_str(), size),
+                std::string_view(decrypted.c_str(), size));
+    }
+  }
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_tag_verification)
+{
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  uint8_t key[32];
+  for(size_t i=0;i<sizeof(key);i++)
+    key[i]=i*7;
+
+  auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes.get(), nullptr);
+
+  const size_t size = 8192;  // 2 chunks
+  buffer::ptr buf(size);
+  char* p = buf.c_str();
+  for(size_t i = 0; i < size; i++)
+    p[i] = i & 0xFF;
+
+  bufferlist input;
+  input.append(buf);
+
+  bufferlist encrypted;
+  ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+  // Corrupt the ciphertext
+  char* enc_p = encrypted.c_str();
+  enc_p[100] ^= 0xFF;
+
+  bufferlist decrypted;
+  // Decryption should fail due to tag mismatch
+  ASSERT_FALSE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
 }
 
 

@@ -24,6 +24,7 @@
 #include <unicode/normalizer2.h>	// libicu
 
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -653,17 +654,24 @@ public:
 
   const DoutPrefixProvider* dpp;
 private:
-  static const uint8_t IV[AES_256_IVSIZE];
   CephContext* cct;
   uint8_t key[AES_256_KEYSIZE];
+  uint8_t base_key[AES_256_KEYSIZE];  // For SSE-C: stores object key before part derivation
+  bool has_base_key = false;          // True if base_key is valid (SSE-C with key derivation)
+  uint8_t base_nonce[AES_256_IVSIZE];
+  bool nonce_initialized = false;
+  uint32_t part_number_ = 0;  // For multipart: ensures unique IVs across parts
 
 public:
   explicit AES_256_GCM(const DoutPrefixProvider* dpp, CephContext* cct)
     : dpp(dpp), cct(cct) {
+    memset(base_nonce, 0, AES_256_IVSIZE);
   }
 
   ~AES_256_GCM() {
     ::ceph::crypto::zeroize_for_security(key, AES_256_KEYSIZE);
+    ::ceph::crypto::zeroize_for_security(base_key, AES_256_KEYSIZE);
+    ::ceph::crypto::zeroize_for_security(base_nonce, AES_256_IVSIZE);
   }
 
   bool set_key(const uint8_t* _key, size_t key_size) {
@@ -671,6 +679,219 @@ public:
       return false;
     }
     memcpy(key, _key, AES_256_KEYSIZE);
+    return true;
+  }
+
+  /**
+   * Generate a random base nonce for this object.
+   * Called during encryption to create a unique nonce per object.
+   */
+  bool generate_nonce() {
+    cct->random()->get_bytes(reinterpret_cast<char*>(base_nonce), AES_256_IVSIZE);
+    nonce_initialized = true;
+    return true;
+  }
+
+  /**
+   * Set the base nonce from a stored value.
+   * Called during decryption to restore the object's nonce.
+   */
+  bool set_nonce(const uint8_t* nonce, size_t len) {
+    if (len != AES_256_IVSIZE) {
+      return false;
+    }
+    memcpy(base_nonce, nonce, AES_256_IVSIZE);
+    nonce_initialized = true;
+    return true;
+  }
+
+  /**
+   * Get the base nonce for storage in object attributes.
+   */
+  std::string get_nonce() const {
+    return std::string(reinterpret_cast<const char*>(base_nonce), AES_256_IVSIZE);
+  }
+
+  bool is_nonce_initialized() const {
+    return nonce_initialized;
+  }
+
+  /**
+   * Set part number for multipart IV derivation and key derivation (SSE-C).
+   * Must be called before encrypt/decrypt for multipart uploads.
+   *
+   * For SSE-C mode (has_base_key=true): also re-derives the part-specific key
+   * from base_key, enabling correct decryption when switching between parts
+   * during multipart GET operations.
+   */
+  void set_part_number(uint32_t part_number) override {
+    this->part_number_ = part_number;
+
+    // For SSE-C mode, also derive the correct part key
+    if (has_base_key && part_number > 0) {
+      // Restore base key, then derive part key
+      memcpy(this->key, this->base_key, AES_256_KEYSIZE);
+      derive_part_key(part_number);
+    } else if (has_base_key && part_number == 0) {
+      // Part 0 means single-part or init - use base key directly
+      memcpy(this->key, this->base_key, AES_256_KEYSIZE);
+    }
+    // For non-SSE-C modes (has_base_key=false), only IV derivation uses part_number
+  }
+
+  /**
+   * Derive object-specific encryption key from user key + object identity.
+   * This provides cryptographic binding between ciphertext and object identity:
+   * - If object is moved/renamed at RADOS level → wrong key → decrypt fails
+   * - If user context doesn't match → wrong key → decrypt fails
+   *
+   * Key derivation formula:
+   *   ObjectKey = HMAC-SHA256(key, nonce || domain || bucket || object || version_id || user_context)
+   *
+   * @param user_key The user-provided encryption key (32 bytes)
+   * @param key_len Length of user_key (must be 32)
+   * @param bucket Bucket name
+   * @param object Object name
+   * @param version_id Version ID (empty for non-versioned objects)
+   * @param user_context User-provided encryption context from header (may be empty)
+   * @param part_number Part number for multipart uploads (0 for non-multipart)
+   * @param domain Domain separator string for algorithm binding (e.g., "SSE-C-GCM", "RGW-AUTO-GCM")
+   * @return true on success
+   */
+  bool derive_object_key(
+      const uint8_t* user_key,
+      size_t key_len,
+      const std::string& bucket,
+      const std::string& object,
+      const std::string& version_id,
+      const std::string& user_context,
+      uint32_t part_number,
+      const std::string& domain = "SSE-C-GCM")
+  {
+    if (key_len != AES_256_KEYSIZE) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_object_key: invalid key length "
+                        << key_len << ", expected " << AES_256_KEYSIZE << dendl;
+      return false;
+    }
+    if (!nonce_initialized) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_object_key: nonce not initialized" << dendl;
+      return false;
+    }
+
+    // HMAC-SHA256(user_key, nonce || domain || bucket || object || version_id || user_context)
+    HMAC_CTX* ctx = HMAC_CTX_new();
+    if (!ctx) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_object_key: failed to create HMAC context" << dendl;
+      return false;
+    }
+
+    if (1 != HMAC_Init_ex(ctx, user_key, key_len, EVP_sha256(), nullptr)) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_object_key: HMAC_Init_ex failed" << dendl;
+      HMAC_CTX_free(ctx);
+      return false;
+    }
+
+    // Helper to encode length as 4-byte big-endian and update HMAC
+    // Length-prefixing prevents ambiguous concatenation attacks where
+    // (object="foo", version="bar") could collide with (object="foobar", version="")
+    auto hmac_update_with_length = [&ctx](const std::string_view& data) {
+      uint32_t len = static_cast<uint32_t>(data.size());
+      uint8_t len_buf[4] = {
+        static_cast<uint8_t>((len >> 24) & 0xFF),
+        static_cast<uint8_t>((len >> 16) & 0xFF),
+        static_cast<uint8_t>((len >> 8) & 0xFF),
+        static_cast<uint8_t>(len & 0xFF)
+      };
+      HMAC_Update(ctx, len_buf, 4);
+      if (!data.empty()) {
+        HMAC_Update(ctx, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+      }
+    };
+
+    // Include nonce in key derivation
+    HMAC_Update(ctx, base_nonce, AES_256_IVSIZE);
+
+    // Domain separator (length-prefixed for consistency)
+    hmac_update_with_length(domain);
+
+    // Include bucket/object/version_id/user_context with length prefixes
+    // Format: nonce || len(domain) || domain || len(bucket) || bucket || len(object) || object
+    //         || len(version_id) || version_id || len(user_context) || user_context
+    hmac_update_with_length(bucket);
+    hmac_update_with_length(object);
+    hmac_update_with_length(version_id);
+    hmac_update_with_length(user_context);
+
+    unsigned int derived_len = 0;
+    if (1 != HMAC_Final(ctx, this->key, &derived_len)) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_object_key: HMAC_Final failed" << dendl;
+      HMAC_CTX_free(ctx);
+      return false;
+    }
+    HMAC_CTX_free(ctx);
+
+    if (derived_len != AES_256_KEYSIZE) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_object_key: unexpected derived key length "
+                        << derived_len << dendl;
+      return false;
+    }
+
+    // Store part_number for IV derivation (ensures unique IVs across parts)
+    this->part_number_ = part_number;
+
+    // Save base key for later part key derivation (needed for multipart GET)
+    // This allows set_part_number() to re-derive the correct part key
+    memcpy(this->base_key, this->key, AES_256_KEYSIZE);
+    this->has_base_key = true;
+
+    ldpp_dout(dpp, 20) << "derive_object_key: derived key for bucket=" << bucket
+                       << " object=" << object
+                       << " version_id=" << (version_id.empty() ? "(none)" : version_id)
+                       << " user_context=" << (user_context.empty() ? "(none)" : "(provided)")
+                       << " part_number=" << part_number << dendl;
+
+    // For multipart, derive part-specific key
+    if (part_number > 0) {
+      return derive_part_key(part_number);
+    }
+    return true;
+  }
+
+  /**
+   * Derive part-specific key for multipart uploads.
+   * This prevents part reordering/swapping attacks.
+   *
+   * Formula: PartKey = HMAC-SHA256(ObjectKey, part_number)
+   *
+   * @param part_number Part number (1-based, as per S3 multipart API)
+   * @return true on success
+   */
+  bool derive_part_key(uint32_t part_number) {
+    // Encode part number as big-endian 4 bytes
+    uint8_t part_bytes[4];
+    part_bytes[0] = (part_number >> 24) & 0xFF;
+    part_bytes[1] = (part_number >> 16) & 0xFF;
+    part_bytes[2] = (part_number >> 8) & 0xFF;
+    part_bytes[3] = part_number & 0xFF;
+
+    uint8_t derived[AES_256_KEYSIZE];
+    unsigned int derived_len = 0;
+
+    if (!HMAC(EVP_sha256(), this->key, AES_256_KEYSIZE,
+              part_bytes, 4, derived, &derived_len)) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_part_key: HMAC failed" << dendl;
+      return false;
+    }
+
+    if (derived_len != AES_256_KEYSIZE) {
+      ldpp_dout(dpp, 0) << "ERROR: derive_part_key: unexpected derived key length "
+                        << derived_len << dendl;
+      return false;
+    }
+
+    memcpy(this->key, derived, AES_256_KEYSIZE);
+
+    ldpp_dout(dpp, 20) << "derive_part_key: derived key for part " << part_number << dendl;
     return true;
   }
 
@@ -682,12 +903,28 @@ public:
     return ENCRYPTED_CHUNK_SIZE;
   }
 
+  /**
+   * Encode chunk index as 8-byte big-endian AAD.
+   * Binds ciphertext to stream position, preventing chunk reordering attacks.
+   */
+  static void encode_chunk_aad(uint8_t (&aad)[8], uint64_t chunk_index) {
+    aad[0] = (chunk_index >> 56) & 0xFF;
+    aad[1] = (chunk_index >> 48) & 0xFF;
+    aad[2] = (chunk_index >> 40) & 0xFF;
+    aad[3] = (chunk_index >> 32) & 0xFF;
+    aad[4] = (chunk_index >> 24) & 0xFF;
+    aad[5] = (chunk_index >> 16) & 0xFF;
+    aad[6] = (chunk_index >> 8) & 0xFF;
+    aad[7] = chunk_index & 0xFF;
+  }
+
   bool gcm_encrypt_chunk(unsigned char* out,
                          const unsigned char* in,
                          size_t size,
                          const unsigned char (&iv)[AES_256_IVSIZE],
                          const unsigned char (&key)[AES_256_KEYSIZE],
-                         unsigned char* tag)
+                         unsigned char* tag,
+                         uint64_t chunk_index)
   {
     using pctx_t = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>;
     pctx_t pctx{ EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free };
@@ -718,9 +955,18 @@ public:
       return false;
     }
 
-    // Encrypt data
+    // Add AAD for chunk ordering protection
+    uint8_t aad[8];
+    encode_chunk_aad(aad, chunk_index);
+    int aad_len = 0;
+    if (1 != EVP_EncryptUpdate(pctx.get(), nullptr, &aad_len, aad, sizeof(aad))) {
+      ldpp_dout(dpp, 5) << "EVP: failed to set AAD" << dendl;
+      return false;
+    }
+
+    // Encrypt data (size is at most CHUNK_SIZE, well within int range for EVP API)
     int written = 0;
-    ceph_assert(size <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    ceph_assert(size <= CHUNK_SIZE);
     if (1 != EVP_EncryptUpdate(pctx.get(), out, &written, in, size)) {
       ldpp_dout(dpp, 5) << "EVP: EncryptUpdate failed" << dendl;
       return false;
@@ -748,7 +994,8 @@ public:
                          size_t size,
                          const unsigned char (&iv)[AES_256_IVSIZE],
                          const unsigned char (&key)[AES_256_KEYSIZE],
-                         const unsigned char* tag)
+                         const unsigned char* tag,
+                         uint64_t chunk_index)
   {
     using pctx_t = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>;
     pctx_t pctx{ EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free };
@@ -771,9 +1018,18 @@ public:
       return false;
     }
 
-    // Decrypt data
+    // Add AAD for chunk ordering protection (must match encryption)
+    uint8_t aad[8];
+    encode_chunk_aad(aad, chunk_index);
+    int aad_len = 0;
+    if (1 != EVP_DecryptUpdate(pctx.get(), nullptr, &aad_len, aad, sizeof(aad))) {
+      ldpp_dout(dpp, 5) << "EVP: failed to set AAD" << dendl;
+      return false;
+    }
+
+    // Decrypt data (size is at most CHUNK_SIZE, well within int range for EVP API)
     int written = 0;
-    ceph_assert(size <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    ceph_assert(size <= CHUNK_SIZE);
     if (1 != EVP_DecryptUpdate(pctx.get(), out, &written, in, size)) {
       ldpp_dout(dpp, 5) << "EVP: DecryptUpdate failed" << dendl;
       return false;
@@ -824,12 +1080,13 @@ public:
     for (size_t offset = 0; offset < num_full_chunks * CHUNK_SIZE; offset += CHUNK_SIZE) {
       unsigned char iv[AES_256_IVSIZE];
       prepare_iv(iv, stream_offset + offset);
+      uint64_t chunk_index = (stream_offset + offset) / CHUNK_SIZE;
 
       unsigned char* ciphertext = buf_raw + out_pos;
       unsigned char* tag = buf_raw + out_pos + CHUNK_SIZE;
 
       if (!gcm_encrypt_chunk(ciphertext, input_raw + offset, CHUNK_SIZE,
-                             iv, key, tag)) {
+                             iv, key, tag, chunk_index)) {
         ldpp_dout(dpp, 5) << "Failed to encrypt chunk at offset " << offset << dendl;
         return false;
       }
@@ -841,12 +1098,13 @@ public:
     if (remainder > 0) {
       unsigned char iv[AES_256_IVSIZE];
       prepare_iv(iv, stream_offset + num_full_chunks * CHUNK_SIZE);
+      uint64_t chunk_index = (stream_offset + num_full_chunks * CHUNK_SIZE) / CHUNK_SIZE;
 
       unsigned char* ciphertext = buf_raw + out_pos;
       unsigned char* tag = buf_raw + out_pos + remainder;
 
       if (!gcm_encrypt_chunk(ciphertext, input_raw + num_full_chunks * CHUNK_SIZE,
-                             remainder, iv, key, tag)) {
+                             remainder, iv, key, tag, chunk_index)) {
         ldpp_dout(dpp, 5) << "Failed to encrypt final chunk" << dendl;
         return false;
       }
@@ -893,12 +1151,13 @@ public:
     for (size_t i = 0; i < num_full_chunks; i++) {
       unsigned char iv[AES_256_IVSIZE];
       prepare_iv(iv, stream_offset + i * CHUNK_SIZE);
+      uint64_t chunk_index = (stream_offset + i * CHUNK_SIZE) / CHUNK_SIZE;
 
       unsigned char* ciphertext = input_raw + in_pos;
       unsigned char* tag = input_raw + in_pos + CHUNK_SIZE;
 
       if (!gcm_decrypt_chunk(buf_raw + out_pos, ciphertext, CHUNK_SIZE,
-                             iv, key, tag)) {
+                             iv, key, tag, chunk_index)) {
         ldpp_dout(dpp, 5) << "GCM: Failed to decrypt chunk " << i
                           << " - authentication failed" << dendl;
         return false;
@@ -913,12 +1172,13 @@ public:
       size_t plaintext_size = remainder - GCM_TAG_SIZE;
       unsigned char iv[AES_256_IVSIZE];
       prepare_iv(iv, stream_offset + num_full_chunks * CHUNK_SIZE);
+      uint64_t chunk_index = (stream_offset + num_full_chunks * CHUNK_SIZE) / CHUNK_SIZE;
 
       unsigned char* ciphertext = input_raw + in_pos;
       unsigned char* tag = input_raw + in_pos + plaintext_size;
 
       if (!gcm_decrypt_chunk(buf_raw + out_pos, ciphertext, plaintext_size,
-                             iv, key, tag)) {
+                             iv, key, tag, chunk_index)) {
         ldpp_dout(dpp, 5) << "GCM: Failed to decrypt final chunk - authentication failed" << dendl;
         return false;
       }
@@ -931,39 +1191,122 @@ public:
     return true;
   }
 
+  /**
+   * Derive per-chunk nonce from base_nonce + combined index.
+   * This ensures each chunk has a unique nonce while maintaining
+   * the "number used once" property required by GCM.
+   *
+   * For multipart uploads, we combine part_number and chunk_index to ensure
+   * unique IVs across all parts (since each part's offset starts at 0).
+   *
+   * Combined index layout (64 bits):
+   *   - Upper 24 bits: part_number (supports up to 16M parts; S3 limit is 10K)
+   *   - Lower 40 bits: chunk_index (supports up to 1T chunks per part)
+   */
   void prepare_iv(unsigned char (&iv)[AES_256_IVSIZE], off_t offset) {
-    // Derive IV from chunk index and base IV
-    off_t index = offset / CHUNK_SIZE;
-    off_t i = AES_256_IVSIZE - 1;
+    ceph_assert(nonce_initialized);
+
+    // Combine part_number and chunk_index to ensure unique IVs across parts
+    // Without this, multipart parts would reuse IVs (all start at offset 0)
+    uint64_t chunk_index = offset / CHUNK_SIZE;
+    uint64_t combined_index = (static_cast<uint64_t>(part_number_) << 40) | chunk_index;
+
+    // Derive IV: base_nonce + combined_index (with carry propagation)
+    int i = AES_256_IVSIZE - 1;
     unsigned int val;
     unsigned int carry = 0;
 
     while (i >= 0) {
-      val = (index & 0xff) + IV[i] + carry;
-      iv[i] = val;
+      val = (combined_index & 0xff) + base_nonce[i] + carry;
+      iv[i] = static_cast<unsigned char>(val);
       carry = val >> 8;
-      index = index >> 8;
+      combined_index = combined_index >> 8;
       i--;
     }
   }
 };
 
 
+/**
+ * Create an AES-256-GCM BlockCrypt instance.
+ *
+ * For encryption: Pass nonce=nullptr to generate a random nonce.
+ *                 After creation, call get_nonce() to retrieve it for storage.
+ *
+ * For decryption: Pass the stored nonce from RGW_ATTR_CRYPT_NONCE.
+ */
 std::unique_ptr<BlockCrypt> AES_256_GCM_create(const DoutPrefixProvider* dpp,
                                                 CephContext* cct,
                                                 const uint8_t* key,
-                                                size_t len)
+                                                size_t key_len,
+                                                const uint8_t* nonce,
+                                                size_t nonce_len,
+                                                uint32_t part_number)
 {
-  auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(dpp, cct));
-  if (!gcm->set_key(key, AES_256_GCM::AES_256_KEYSIZE)) {
+  // Validate key_len to prevent OOB read if caller passes smaller buffer
+  if (key_len != AES_256_GCM::AES_256_KEYSIZE) {
+    ldpp_dout(dpp, 5) << "AES_256_GCM_create: invalid key size " << key_len
+                      << ", expected " << AES_256_GCM::AES_256_KEYSIZE << dendl;
     return nullptr;
   }
+
+  auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(dpp, cct));
+  if (!gcm->set_key(key, key_len)) {
+    return nullptr;
+  }
+
+  // Set part_number for multipart IV derivation (ensures unique IVs across parts)
+  gcm->set_part_number(part_number);
+
+  if (nonce != nullptr) {
+    // Decryption path: use the provided stored nonce
+    if (!gcm->set_nonce(nonce, nonce_len)) {
+      ldpp_dout(dpp, 5) << "AES_256_GCM_create: invalid nonce size " << nonce_len << dendl;
+      return nullptr;
+    }
+  } else {
+    // Encryption path: generate a random nonce
+    gcm->generate_nonce();
+  }
+
   return gcm;
 }
 
 
-const uint8_t AES_256_GCM::IV[AES_256_GCM::AES_256_IVSIZE] =
-    { 'a', 'e', 's', '2', '5', '6', 'g', 'c', 'm', 'i', 'v', '0' };
+/**
+ * Retrieve the nonce from a BlockCrypt instance for storage.
+ * Returns empty string if the BlockCrypt is not an AES_256_GCM instance.
+ */
+std::string AES_256_GCM_get_nonce(BlockCrypt* block_crypt)
+{
+  auto* gcm = dynamic_cast<AES_256_GCM*>(block_crypt);
+  if (gcm && gcm->is_nonce_initialized()) {
+    return gcm->get_nonce();
+  }
+  return {};
+}
+
+/**
+ * Test helper: derive object key for a BlockCrypt instance.
+ * Returns true on success.
+ */
+bool AES_256_GCM_derive_object_key(BlockCrypt* block_crypt,
+                                    const uint8_t* user_key,
+                                    size_t key_len,
+                                    const std::string& bucket,
+                                    const std::string& object,
+                                    const std::string& version_id,
+                                    const std::string& user_context,
+                                    uint32_t part_number,
+                                    const std::string& domain)
+{
+  auto* gcm = dynamic_cast<AES_256_GCM*>(block_crypt);
+  if (!gcm) {
+    return false;
+  }
+  return gcm->derive_object_key(user_key, key_len, bucket, object,
+                                 version_id, user_context, part_number, domain);
+}
 
 
 bool AES_256_ECB_encrypt(const DoutPrefixProvider* dpp,
@@ -998,12 +1341,14 @@ RGWGetObj_BlockDecrypt::RGWGetObj_BlockDecrypt(const DoutPrefixProvider *dpp,
     crypt(std::move(crypt)),
     enc_begin_skip(0),
     ofs(0),
+    enc_ofs(0),
     end(0),
     cache(),
     y(y),
     parts_len(std::move(parts_len))
 {
   block_size = this->crypt->get_block_size();
+  encrypted_block_size = this->crypt->get_encrypted_block_size();
 }
 
 RGWGetObj_BlockDecrypt::~RGWGetObj_BlockDecrypt() {
@@ -1039,44 +1384,106 @@ int RGWGetObj_BlockDecrypt::read_manifest_parts(const DoutPrefixProvider *dpp,
 int RGWGetObj_BlockDecrypt::fixup_range(off_t& bl_ofs, off_t& bl_end) {
   off_t inp_ofs = bl_ofs;
   off_t inp_end = bl_end;
-  if (parts_len.size() > 0) {
-    off_t in_ofs = bl_ofs;
-    off_t in_end = bl_end;
 
+  // For size-expanding ciphers (GCM), we need to convert between logical and encrypted offsets.
+  // Input bl_ofs/bl_end are logical (plaintext) offsets.
+  // Output bl_ofs/bl_end must be encrypted (storage) offsets.
+  const bool size_expanding = (block_size != encrypted_block_size);
+
+  if (parts_len.size() > 0) {
+    // Multipart object: work in plaintext offsets, then convert to encrypted.
+    off_t in_ofs = bl_ofs;  // Will become plaintext offset within part i
+    off_t in_end = bl_end;  // Will become plaintext offset within part j
+
+    // Find part i containing in_ofs by subtracting plaintext sizes
     size_t i = 0;
-    while (i<parts_len.size() && (in_ofs >= (off_t)parts_len[i])) {
-      in_ofs -= parts_len[i];
+    off_t cumulative_encrypted = 0;
+    while (i < parts_len.size()) {
+      size_t part_plaintext = encrypted_to_plaintext_size(parts_len[i]);
+      if (in_ofs < (off_t)part_plaintext) {
+        break;  // in_ofs is within part i
+      }
+      in_ofs -= part_plaintext;
+      cumulative_encrypted += parts_len[i];
       i++;
     }
-    //in_ofs is inside block i
+    // in_ofs is now plaintext offset within part i (or i==size if beyond all parts)
+
+    // Find part j containing in_end (clamp to last part)
     size_t j = 0;
-    while (j<(parts_len.size() - 1) && (in_end >= (off_t)parts_len[j])) {
-      in_end -= parts_len[j];
+    off_t cumulative_encrypted_j = 0;
+    while (j < (parts_len.size() - 1)) {
+      size_t part_plaintext = encrypted_to_plaintext_size(parts_len[j]);
+      if (in_end < (off_t)part_plaintext) {
+        break;  // in_end is within part j
+      }
+      in_end -= part_plaintext;
+      cumulative_encrypted_j += parts_len[j];
       j++;
     }
-    //in_end is inside part j, OR j is the last part
+    // in_end is now plaintext offset within part j, j is always valid (clamped to last)
 
-    size_t rounded_end = ( in_end & ~(block_size - 1) ) + (block_size - 1);
-    if (rounded_end > parts_len[j]) {
-      rounded_end = parts_len[j] - 1;
+    // Block-align end within part j (in plaintext space, using plaintext block_size)
+    size_t part_plaintext_j = encrypted_to_plaintext_size(parts_len[j]);
+    size_t rounded_end = (in_end & ~(block_size - 1)) + (block_size - 1);
+    if (rounded_end > part_plaintext_j - 1) {
+      rounded_end = part_plaintext_j - 1;
     }
 
+    // enc_begin_skip is offset within the block
     enc_begin_skip = in_ofs & (block_size - 1);
     ofs = bl_ofs - enc_begin_skip;
     end = bl_end;
-    bl_end += rounded_end - in_end;
-    bl_ofs = std::min(bl_ofs - enc_begin_skip, bl_end);
+
+    // Convert plaintext offsets to encrypted for output
+    // For bl_end: convert rounded_end (plaintext within part j) to encrypted
+    off_t enc_rounded_end = logical_to_encrypted_offset(rounded_end);
+    if (enc_rounded_end > (off_t)parts_len[j] - 1) {
+      enc_rounded_end = parts_len[j] - 1;
+    }
+    bl_end = cumulative_encrypted_j + enc_rounded_end;
+
+    // For bl_ofs: convert aligned start to encrypted
+    off_t aligned_in_ofs = in_ofs - enc_begin_skip;
+    if (aligned_in_ofs < 0) aligned_in_ofs = 0;
+    off_t enc_aligned_ofs = logical_to_encrypted_offset(aligned_in_ofs);
+    bl_ofs = cumulative_encrypted + enc_aligned_ofs;
+
+    // Original pattern: clamp bl_ofs to bl_end (handles invalid ranges)
+    bl_ofs = std::min(bl_ofs, bl_end);
+
+    // Track encrypted position for part boundary handling
+    enc_ofs = bl_ofs;
   }
   else
   {
+    // Simple object (no multipart)
+    // enc_begin_skip is the offset within the logical block
     enc_begin_skip = bl_ofs & (block_size - 1);
+    // ofs is the logical offset aligned to block boundary
     ofs = bl_ofs & ~(block_size - 1);
+    enc_ofs = logical_to_encrypted_offset(ofs);  // Track encrypted position
     end = bl_end;
-    bl_ofs = bl_ofs & ~(block_size - 1);
-    bl_end = ( bl_end & ~(block_size - 1) ) + (block_size - 1);
+
+    // Calculate aligned logical range
+    off_t aligned_logical_start = bl_ofs & ~(block_size - 1);
+    off_t aligned_logical_end = (bl_end & ~(block_size - 1)) + (block_size - 1);
+
+    // Convert to encrypted offsets for storage fetch
+    bl_ofs = logical_to_encrypted_offset(aligned_logical_start);
+    bl_end = logical_to_encrypted_offset(aligned_logical_end);
+
+    // For GCM, ensure we fetch complete encrypted blocks (including tags)
+    // Note: use division, not bitmask - encrypted_block_size may not be power of 2
+    if (size_expanding) {
+      bl_end = (bl_end / encrypted_block_size) * encrypted_block_size + (encrypted_block_size - 1);
+    }
   }
+
   ldpp_dout(this->dpp, 20) << "fixup_range [" << inp_ofs << "," << inp_end
-      << "] => [" << bl_ofs << "," << bl_end << "]" << dendl;
+      << "] => [" << bl_ofs << "," << bl_end << "]"
+      << " (block_size=" << block_size
+      << ", encrypted_block_size=" << encrypted_block_size << ")" << dendl;
 
   if (next)
     return next->fixup_range(bl_ofs, bl_end);
@@ -1090,41 +1497,93 @@ int RGWGetObj_BlockDecrypt::process(bufferlist& in, size_t part_ofs, size_t size
   if (!crypt->decrypt(in, 0, size, data, part_ofs, y)) {
     return -ERR_INTERNAL_ERROR;
   }
-  off_t send_size = size - enc_begin_skip;
+
+  // data.length() is the decrypted (plaintext) size
+  // For GCM: data.length() < size (due to tag removal)
+  // For CBC: data.length() == size
+  off_t decrypted_size = data.length();
+
+  off_t send_size = decrypted_size - enc_begin_skip;
   if (ofs + enc_begin_skip + send_size > end + 1) {
     send_size = end + 1 - ofs - enc_begin_skip;
   }
   int res = next->handle_data(data, enc_begin_skip, send_size);
   enc_begin_skip = 0;
-  ofs += size;
-  in.splice(0, size);
+  ofs += decrypted_size;  // Advance plaintext position
+  enc_ofs += size;        // Advance encrypted position (for part boundary tracking)
+  in.splice(0, size);     // Remove encrypted data from input buffer
   return res;
 }
 
 int RGWGetObj_BlockDecrypt::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) {
-  ldpp_dout(this->dpp, 25) << "Decrypt " << bl_len << " bytes" << dendl;
+  ldpp_dout(this->dpp, 25) << "Decrypt " << bl_len << " bytes"
+      << " (encrypted_block_size=" << encrypted_block_size << ")" << dendl;
   bl.begin(bl_ofs).copy(bl_len, cache);
 
   int res = 0;
-  size_t part_ofs = ofs;
+
+  // For part boundary tracking: use encrypted offset (parts_len has encrypted sizes)
+  // For stream_offset to decrypt: use plaintext offset (for correct nonce derivation)
+  size_t enc_part_ofs = enc_ofs;   // encrypted offset within current part
+  size_t plain_part_ofs = ofs;     // plaintext offset within current part
+
+  // Track which part we're in (part numbers are 1-based in multipart uploads)
+  // Only switch part numbers for true multipart objects (parts_len.size() > 1).
+  // Single-entry parts_len could be from manifest stripes of a non-multipart object,
+  // which was encrypted with part_number=0. Setting part_number=1 would cause mismatch.
+  const bool is_multipart = (parts_len.size() > 1);
+  uint32_t part_idx = 0;
   for (size_t part : parts_len) {
-    if (part_ofs >= part) {
-      part_ofs -= part;
-    } else if (part_ofs + cache.length() >= part) {
-      // flush data up to part boundaries, aligned or not
-      res = process(cache, part_ofs, part - part_ofs);
+    // Multipart part numbers are 1-based; non-multipart uses 0
+    uint32_t this_part_num = is_multipart ? (part_idx + 1) : 0;
+
+    if (enc_part_ofs >= part) {
+      // We're past this part entirely, skip to next
+      enc_part_ofs -= part;
+      plain_part_ofs -= encrypted_to_plaintext_size(part);
+      part_idx++;
+    } else if (enc_part_ofs + cache.length() >= part) {
+      // Ensure cipher has correct part number for this part
+      if (is_multipart && current_part_num != this_part_num) {
+        current_part_num = this_part_num;
+        crypt->set_part_number(current_part_num);
+      }
+
+      // Data crosses a part boundary - process up to the boundary
+      size_t enc_bytes_this_part = part - enc_part_ofs;
+      res = process(cache, plain_part_ofs, enc_bytes_this_part);
       if (res < 0) {
         return res;
       }
-      part_ofs = 0;
+
+      // Move to next part
+      part_idx++;
+      uint32_t next_part_num = is_multipart ? (part_idx + 1) : 0;
+      if (is_multipart && part_idx < parts_len.size() && current_part_num != next_part_num) {
+        current_part_num = next_part_num;
+        crypt->set_part_number(current_part_num);
+      }
+
+      // Reset for next part (both offsets start at 0 within the new part)
+      enc_part_ofs = 0;
+      plain_part_ofs = 0;
     } else {
+      // Ensure cipher has correct part number for this part
+      if (is_multipart && current_part_num != this_part_num) {
+        current_part_num = this_part_num;
+        crypt->set_part_number(current_part_num);
+      }
       break;
     }
   }
-  // write up to block boundaries, aligned only
-  off_t aligned_size = cache.length() & ~(block_size - 1);
+
+  // Process up to encrypted block boundaries
+  // For GCM: need complete encrypted blocks (4112 bytes) to decrypt
+  // For CBC: encrypted_block_size == block_size, so no change
+  // Note: use division, not bitmask - encrypted_block_size may not be power of 2
+  off_t aligned_size = (cache.length() / encrypted_block_size) * encrypted_block_size;
   if (aligned_size > 0) {
-    res = process(cache, part_ofs, aligned_size);
+    res = process(cache, plain_part_ofs, aligned_size);
   }
   return res;
 }
@@ -1135,24 +1594,63 @@ int RGWGetObj_BlockDecrypt::handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_l
 int RGWGetObj_BlockDecrypt::flush() {
   ldpp_dout(this->dpp, 25) << "Decrypt flushing " << cache.length() << " bytes" << dendl;
   int res = 0;
-  size_t part_ofs = ofs;
+
+  // For part boundary tracking: use encrypted offset (parts_len has encrypted sizes)
+  // For stream_offset to decrypt: use plaintext offset (for correct nonce derivation)
+  size_t enc_part_ofs = enc_ofs;   // encrypted offset within current part
+  size_t plain_part_ofs = ofs;     // plaintext offset within current part
+
+  // Track which part we're in (part numbers are 1-based in multipart uploads)
+  // Only switch part numbers for true multipart objects (parts_len.size() > 1).
+  const bool is_multipart = (parts_len.size() > 1);
+  uint32_t part_idx = 0;
   for (size_t part : parts_len) {
-    if (part_ofs >= part) {
-      part_ofs -= part;
-    } else if (part_ofs + cache.length() >= part) {
-      // flush data up to part boundaries, aligned or not
-      res = process(cache, part_ofs, part - part_ofs);
+    // Multipart part numbers are 1-based; non-multipart uses 0
+    uint32_t this_part_num = is_multipart ? (part_idx + 1) : 0;
+
+    if (enc_part_ofs >= part) {
+      // We're past this part entirely, skip to next
+      enc_part_ofs -= part;
+      plain_part_ofs -= encrypted_to_plaintext_size(part);
+      part_idx++;
+    } else if (enc_part_ofs + cache.length() >= part) {
+      // Ensure cipher has correct part number for this part
+      if (is_multipart && current_part_num != this_part_num) {
+        current_part_num = this_part_num;
+        crypt->set_part_number(current_part_num);
+      }
+
+      // Data crosses a part boundary - process up to the boundary
+      size_t enc_bytes_this_part = part - enc_part_ofs;
+      res = process(cache, plain_part_ofs, enc_bytes_this_part);
       if (res < 0) {
         return res;
       }
-      part_ofs = 0;
+
+      // Move to next part
+      part_idx++;
+      uint32_t next_part_num = is_multipart ? (part_idx + 1) : 0;
+      if (is_multipart && part_idx < parts_len.size() && current_part_num != next_part_num) {
+        current_part_num = next_part_num;
+        crypt->set_part_number(current_part_num);
+      }
+
+      // Reset for next part
+      enc_part_ofs = 0;
+      plain_part_ofs = 0;
     } else {
+      // Ensure cipher has correct part number for this part
+      if (is_multipart && current_part_num != this_part_num) {
+        current_part_num = this_part_num;
+        crypt->set_part_number(current_part_num);
+      }
       break;
     }
   }
-  // flush up to block boundaries, aligned or not
+
+  // flush remaining data (possibly unaligned final block)
   if (cache.length() > 0) {
-    res = process(cache, part_ofs, cache.length());
+    res = process(cache, plain_part_ofs, cache.length());
     if (res < 0) {
       return res;
     }
@@ -1199,15 +1697,17 @@ int RGWPutObj_BlockEncrypt::process(bufferlist&& data, uint64_t logical_offset)
     if (!crypt->encrypt(in, 0, proc_size, out, logical_offset, y)) {
       return -ERR_INTERNAL_ERROR;
     }
-    int r = Pipe::process(std::move(out), logical_offset);
-    logical_offset += proc_size;
+    // For size-expanding ciphers (GCM), out.length() > proc_size
+    // Use encrypted_offset for downstream writes, not plaintext logical_offset
+    int r = Pipe::process(std::move(out), encrypted_offset);
+    encrypted_offset += out.length();
     if (r < 0)
       return r;
   }
 
   if (flush) {
     /*replicate 0-sized handle_data*/
-    return Pipe::process({}, logical_offset);
+    return Pipe::process({}, encrypted_offset);
   }
   return 0;
 }
@@ -1368,7 +1868,8 @@ static int get_sse_s3_bucket_key(req_state *s, optional_yield y,
 int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
                            std::map<std::string, ceph::bufferlist>& attrs,
                            std::unique_ptr<BlockCrypt>* block_crypt,
-                           std::map<std::string, std::string>& crypt_http_responses)
+                           std::map<std::string, std::string>& crypt_http_responses,
+                           uint32_t part_number)
 {
   int res = 0;
   CryptAttributes crypt_attributes { s };
@@ -1446,13 +1947,62 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return -EINVAL;
       }
 
-      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-C-AES256-GCM");
       set_attr(attrs, RGW_ATTR_CRYPT_KEYMD5, keymd5_bin);
 
-      if (block_crypt) {
-        auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-        aes->set_key(reinterpret_cast<const uint8_t*>(key_bin.c_str()), AES_256_KEYSIZE);
-        *block_crypt = std::move(aes);
+      // Check config for encryption algorithm preference
+      const bool use_gcm = (s->cct->_conf->rgw_crypt_sse_algorithm == "aes-256-gcm");
+
+      if (use_gcm) {
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-C-AES256-GCM");
+
+        // Parse encryption context if provided (for key derivation binding)
+        std::string user_context;
+        std::string_view context_header =
+            crypt_attributes.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT);
+        if (!context_header.empty()) {
+          if ((res = make_canonical_context(s, context_header, user_context))) {
+            return res;
+          }
+          set_attr(attrs, RGW_ATTR_CRYPT_CONTEXT, user_context);
+        }
+
+        // Always generate and store nonce, even for multipart init (block_crypt=nullptr)
+        // Each part upload will read this nonce from the upload metadata
+        std::string nonce(AES_256_GCM_NONCE_SIZE, '\0');
+        s->cct->random()->get_bytes(nonce.data(), AES_256_GCM_NONCE_SIZE);
+        set_attr(attrs, RGW_ATTR_CRYPT_NONCE, nonce);
+
+        if (block_crypt) {
+          auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
+          if (!gcm->set_nonce(reinterpret_cast<const uint8_t*>(nonce.c_str()), nonce.size())) {
+            ldpp_dout(s, 5) << "ERROR: SSE-C-AES256-GCM encryption failed: "
+                             << "could not initialize nonce" << dendl;
+            return -EIO;
+          }
+          // Derive encryption key from user key + object identity
+          std::string version_id = s->object ? s->object->get_instance() : "";
+          if (!gcm->derive_object_key(
+                  reinterpret_cast<const uint8_t*>(key_bin.c_str()),
+                  AES_256_KEYSIZE,
+                  s->bucket->get_name(),
+                  s->object->get_name(),
+                  version_id,
+                  user_context,
+                  part_number)) {
+            ldpp_dout(s, 5) << "ERROR: SSE-C-AES256-GCM key derivation failed for "
+                             << s->bucket->get_name() << "/" << s->object->get_name() << dendl;
+            s->err.message = "Failed to derive encryption key.";
+            return -EIO;
+          }
+          *block_crypt = std::move(gcm);
+        }
+      } else {
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-C-AES256");
+        if (block_crypt) {
+          auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+          aes->set_key(reinterpret_cast<const uint8_t*>(key_bin.c_str()), AES_256_KEYSIZE);
+          *block_crypt = std::move(aes);
+        }
       }
 
       crypt_http_responses["x-amz-server-side-encryption-customer-algorithm"] = "AES256";
@@ -1512,7 +2062,6 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
           std::string key_selector = create_random_key_selector(s->cct);
           set_attr(attrs, RGW_ATTR_CRYPT_KEYSEL, key_selector);
         }
-        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-KMS-GCM");
         set_attr(attrs, RGW_ATTR_CRYPT_KEYID, key_id);
         set_attr(attrs, RGW_ATTR_CRYPT_CONTEXT, cooked_context);
         std::string actual_key;
@@ -1529,10 +2078,36 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
           return -EINVAL;
         }
 
-        if (block_crypt) {
-          auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-          aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
-          *block_crypt = std::move(aes);
+        const bool use_gcm = (s->cct->_conf->rgw_crypt_sse_algorithm == "aes-256-gcm");
+
+        if (use_gcm) {
+          set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-KMS-GCM");
+          // Always generate and store nonce, even for multipart init (block_crypt=nullptr)
+          std::string nonce(AES_256_GCM_NONCE_SIZE, '\0');
+          s->cct->random()->get_bytes(nonce.data(), AES_256_GCM_NONCE_SIZE);
+          set_attr(attrs, RGW_ATTR_CRYPT_NONCE, nonce);
+
+          if (block_crypt) {
+            auto aes = AES_256_GCM_create(s, s->cct,
+                                           reinterpret_cast<const uint8_t*>(actual_key.c_str()),
+                                           AES_256_KEYSIZE,
+                                           reinterpret_cast<const uint8_t*>(nonce.c_str()),
+                                           nonce.size(),
+                                           part_number);
+            if (!aes) {
+              ldpp_dout(s, 5) << "ERROR: Failed to create AES-256-GCM instance" << dendl;
+              ::ceph::crypto::zeroize_for_security(actual_key.data(), actual_key.length());
+              return -EIO;
+            }
+            *block_crypt = std::move(aes);
+          }
+        } else {
+          set_attr(attrs, RGW_ATTR_CRYPT_MODE, "SSE-KMS");
+          if (block_crypt) {
+            auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+            aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
+            *block_crypt = std::move(aes);
+          }
         }
         ::ceph::crypto::zeroize_for_security(actual_key.data(), actual_key.length());
 
@@ -1568,7 +2143,6 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
       }
 
       set_attr(attrs, RGW_ATTR_CRYPT_CONTEXT, cooked_context);
-      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "AES256-GCM");
       set_attr(attrs, RGW_ATTR_CRYPT_KEYID, key_id);
       std::string actual_key;
       res = make_actual_key_from_sse_s3(s, attrs, y, actual_key);
@@ -1584,10 +2158,36 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return -EINVAL;
       }
 
-      if (block_crypt) {
-        auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-        aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
-        *block_crypt = std::move(aes);
+      const bool use_gcm = (s->cct->_conf->rgw_crypt_sse_algorithm == "aes-256-gcm");
+
+      if (use_gcm) {
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "AES256-GCM");
+        // Always generate and store nonce, even for multipart init (block_crypt=nullptr)
+        std::string nonce(AES_256_GCM_NONCE_SIZE, '\0');
+        s->cct->random()->get_bytes(nonce.data(), AES_256_GCM_NONCE_SIZE);
+        set_attr(attrs, RGW_ATTR_CRYPT_NONCE, nonce);
+
+        if (block_crypt) {
+          auto aes = AES_256_GCM_create(s, s->cct,
+                                         reinterpret_cast<const uint8_t*>(actual_key.c_str()),
+                                         AES_256_KEYSIZE,
+                                         reinterpret_cast<const uint8_t*>(nonce.c_str()),
+                                         nonce.size(),
+                                         part_number);
+          if (!aes) {
+            ldpp_dout(s, 5) << "ERROR: Failed to create AES-256-GCM instance" << dendl;
+            ::ceph::crypto::zeroize_for_security(actual_key.data(), actual_key.length());
+            return -EIO;
+          }
+          *block_crypt = std::move(aes);
+        }
+      } else {
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "AES256");
+        if (block_crypt) {
+          auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+          aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
+          *block_crypt = std::move(aes);
+        }
       }
       ::ceph::crypto::zeroize_for_security(actual_key.data(), actual_key.length());
 
@@ -1613,24 +2213,65 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return 0;
       }
 
-      set_attr(attrs, RGW_ATTR_CRYPT_MODE, "RGW-AUTO-GCM");
-      std::string key_selector = create_random_key_selector(s->cct);
-      set_attr(attrs, RGW_ATTR_CRYPT_KEYSEL, key_selector);
+      const bool use_gcm = (s->cct->_conf->rgw_crypt_sse_algorithm == "aes-256-gcm");
 
-      uint8_t actual_key[AES_256_KEYSIZE];
-      if (AES_256_ECB_encrypt(s, s->cct,
-                              reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()), AES_256_KEYSIZE,
-                              reinterpret_cast<const uint8_t*>(key_selector.c_str()),
-                              actual_key, AES_256_KEYSIZE) != true) {
+      if (use_gcm) {
+        // GCM mode: use HMAC-SHA256 key derivation with context binding
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "RGW-AUTO-GCM");
+
+        // Generate and store nonce (used for both IV derivation and key derivation)
+        std::string nonce(AES_256_GCM_NONCE_SIZE, '\0');
+        s->cct->random()->get_bytes(nonce.data(), AES_256_GCM_NONCE_SIZE);
+        set_attr(attrs, RGW_ATTR_CRYPT_NONCE, nonce);
+
+        if (block_crypt) {
+          // Create GCM instance with nonce
+          auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
+          if (!gcm->set_nonce(reinterpret_cast<const uint8_t*>(nonce.c_str()), nonce.size())) {
+            ldpp_dout(s, 5) << "ERROR: RGW-AUTO-GCM: could not initialize nonce" << dendl;
+            return -EIO;
+          }
+
+          // Derive encryption key using HMAC-SHA256 with context binding
+          // Key = HMAC-SHA256(master_key, nonce || "RGW-AUTO-GCM" || bucket || object || version_id)
+          std::string version_id = s->object ? s->object->get_instance() : "";
+          if (!gcm->derive_object_key(
+                  reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()),
+                  AES_256_KEYSIZE,
+                  s->bucket->get_name(),
+                  s->object->get_name(),
+                  version_id,
+                  "",  // no user context for RGW-AUTO
+                  part_number,
+                  "RGW-AUTO-GCM")) {
+            ldpp_dout(s, 5) << "ERROR: RGW-AUTO-GCM key derivation failed for "
+                             << s->bucket->get_name() << "/" << s->object->get_name() << dendl;
+            return -EIO;
+          }
+          *block_crypt = std::move(gcm);
+        }
+      } else {
+        // CBC mode: use AES-ECB key derivation (legacy approach)
+        std::string key_selector = create_random_key_selector(s->cct);
+        set_attr(attrs, RGW_ATTR_CRYPT_KEYSEL, key_selector);
+
+        uint8_t actual_key[AES_256_KEYSIZE];
+        if (AES_256_ECB_encrypt(s, s->cct,
+                                reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()), AES_256_KEYSIZE,
+                                reinterpret_cast<const uint8_t*>(key_selector.c_str()),
+                                actual_key, AES_256_KEYSIZE) != true) {
+          ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
+          return -EIO;
+        }
+
+        set_attr(attrs, RGW_ATTR_CRYPT_MODE, "RGW-AUTO");
+        if (block_crypt) {
+          auto aes = std::unique_ptr<AES_256_CBC>(new AES_256_CBC(s, s->cct));
+          aes->set_key(actual_key, AES_256_KEYSIZE);
+          *block_crypt = std::move(aes);
+        }
         ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
-        return -EIO;
       }
-      if (block_crypt) {
-        auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-        aes->set_key(reinterpret_cast<const uint8_t*>(actual_key), AES_256_KEYSIZE);
-        *block_crypt = std::move(aes);
-      }
-      ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
       return 0;
     }
   }
@@ -1642,7 +2283,8 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
                            map<string, bufferlist>& attrs,
                            std::unique_ptr<BlockCrypt>* block_crypt,
                            std::map<std::string, std::string>* crypt_http_responses,
-                           bool copy_source)
+                           bool copy_source,
+                           uint32_t part_number)
 {
   int res = 0;
   std::string stored_mode = get_str_attribute(attrs, RGW_ATTR_CRYPT_MODE);
@@ -1821,9 +2463,54 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
       s->err.message = "The calculated MD5 hash of the key did not match the hash that was provided.";
       return -EINVAL;
     }
-    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-    aes->set_key(reinterpret_cast<const uint8_t*>(key_bin.c_str()), AES_256_KEYSIZE);
-    if (block_crypt) *block_crypt = std::move(aes);
+
+    // Retrieve the stored nonce for decryption
+    std::string stored_nonce = get_str_attribute(attrs, RGW_ATTR_CRYPT_NONCE);
+    if (stored_nonce.size() != AES_256_GCM_NONCE_SIZE) {
+      ldpp_dout(s, 5) << "ERROR: Missing or invalid nonce for SSE-C-AES256-GCM decryption" << dendl;
+      s->err.message = "Object encryption metadata is corrupted.";
+      return -EIO;
+    }
+
+    // Retrieve the stored user context (may be empty)
+    std::string user_context = get_str_attribute(attrs, RGW_ATTR_CRYPT_CONTEXT);
+
+    auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
+    if (!gcm->set_nonce(reinterpret_cast<const uint8_t*>(stored_nonce.c_str()),
+                        stored_nonce.size())) {
+      ldpp_dout(s, 5) << "ERROR: SSE-C-AES256-GCM decryption failed: stored nonce has invalid size "
+                       << stored_nonce.size() << " (expected " << AES_256_GCM_NONCE_SIZE << ")" << dendl;
+      s->err.message = "Object encryption metadata is corrupted.";
+      return -EIO;
+    }
+    // Re-derive encryption key from user key + object identity
+    // For CopyObject, use the SOURCE object's identity (not destination)
+    std::string bucket_name;
+    std::string object_name;
+    std::string version_id;
+    if (copy_source && s->src_object) {
+      bucket_name = s->src_bucket_name;
+      object_name = s->src_object->get_name();
+      version_id = s->src_object->get_instance();
+    } else {
+      bucket_name = s->bucket->get_name();
+      object_name = s->object->get_name();
+      version_id = s->object ? s->object->get_instance() : "";
+    }
+    if (!gcm->derive_object_key(
+            reinterpret_cast<const uint8_t*>(key_bin.c_str()),
+            AES_256_KEYSIZE,
+            bucket_name,
+            object_name,
+            version_id,
+            user_context,
+            part_number)) {
+      ldpp_dout(s, 5) << "ERROR: SSE-C-AES256-GCM key derivation failed for "
+                       << bucket_name << "/" << object_name << dendl;
+      s->err.message = "Failed to derive decryption key.";
+      return -EIO;
+    }
+    if (block_crypt) *block_crypt = std::move(gcm);
 
     if (crypt_http_responses) {
       crypt_http_responses->emplace("x-amz-server-side-encryption-customer-algorithm", "AES256");
@@ -1890,9 +2577,26 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
       return -EINVAL;
     }
 
-    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-    aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
+    // Retrieve the stored nonce for decryption
+    std::string stored_nonce = get_str_attribute(attrs, RGW_ATTR_CRYPT_NONCE);
+    if (stored_nonce.size() != AES_256_GCM_NONCE_SIZE) {
+      ldpp_dout(s, 5) << "ERROR: Missing or invalid nonce for SSE-KMS-GCM decryption" << dendl;
+      actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+      s->err.message = "Object encryption metadata is corrupted.";
+      return -EIO;
+    }
+
+    auto aes = AES_256_GCM_create(s, s->cct,
+                                   reinterpret_cast<const uint8_t*>(actual_key.c_str()),
+                                   AES_256_KEYSIZE,
+                                   reinterpret_cast<const uint8_t*>(stored_nonce.c_str()),
+                                   stored_nonce.size(),
+                                   part_number);
     actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+    if (!aes) {
+      ldpp_dout(s, 5) << "ERROR: Failed to create AES-256-GCM instance for decryption" << dendl;
+      return -EIO;
+    }
     if (block_crypt) *block_crypt = std::move(aes);
 
     if (crypt_http_responses) {
@@ -1956,24 +2660,56 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
       ldpp_dout(s, 0) << "ERROR: failed to decode 'rgw crypt default encryption key' to 256 bit string" << dendl;
       return -EIO;
     }
-    std::string attr_key_selector = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYSEL);
-    if (attr_key_selector.size() != AES_256_KEYSIZE) {
-      ldpp_dout(s, 0) << "ERROR: missing or invalid " RGW_ATTR_CRYPT_KEYSEL << dendl;
+
+    // Retrieve the stored nonce for decryption
+    std::string stored_nonce = get_str_attribute(attrs, RGW_ATTR_CRYPT_NONCE);
+    if (stored_nonce.size() != AES_256_GCM_NONCE_SIZE) {
+      ldpp_dout(s, 5) << "ERROR: Missing or invalid nonce for RGW-AUTO-GCM decryption" << dendl;
+      s->err.message = "Object encryption metadata is corrupted.";
       return -EIO;
     }
-    uint8_t actual_key[AES_256_KEYSIZE];
-    if (AES_256_ECB_encrypt(s, s->cct,
-                            reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()),
-                            AES_256_KEYSIZE,
-                            reinterpret_cast<const uint8_t*>(attr_key_selector.c_str()),
-                            actual_key, AES_256_KEYSIZE) != true) {
-      ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
+
+    // Create GCM instance with stored nonce
+    auto gcm = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
+    if (!gcm->set_nonce(reinterpret_cast<const uint8_t*>(stored_nonce.c_str()),
+                        stored_nonce.size())) {
+      ldpp_dout(s, 5) << "ERROR: RGW-AUTO-GCM decryption: stored nonce has invalid size "
+                       << stored_nonce.size() << " (expected " << AES_256_GCM_NONCE_SIZE << ")" << dendl;
+      s->err.message = "Object encryption metadata is corrupted.";
       return -EIO;
     }
-    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-    aes->set_key(actual_key, AES_256_KEYSIZE);
-    ::ceph::crypto::zeroize_for_security(actual_key, sizeof(actual_key));
-    if (block_crypt) *block_crypt = std::move(aes);
+
+    // Re-derive encryption key using HMAC-SHA256 with context binding
+    // For CopyObject, use the SOURCE object's identity (not destination)
+    std::string bucket_name;
+    std::string object_name;
+    std::string version_id;
+    if (copy_source && s->src_object) {
+      bucket_name = s->src_bucket_name;
+      object_name = s->src_object->get_name();
+      version_id = s->src_object->get_instance();
+    } else {
+      bucket_name = s->bucket->get_name();
+      object_name = s->object->get_name();
+      version_id = s->object ? s->object->get_instance() : "";
+    }
+
+    if (!gcm->derive_object_key(
+            reinterpret_cast<const uint8_t*>(master_encryption_key.c_str()),
+            AES_256_KEYSIZE,
+            bucket_name,
+            object_name,
+            version_id,
+            "",  // no user context for RGW-AUTO
+            part_number,
+            "RGW-AUTO-GCM")) {
+      ldpp_dout(s, 5) << "ERROR: RGW-AUTO-GCM key derivation failed for "
+                       << bucket_name << "/" << object_name << dendl;
+      s->err.message = "Failed to derive decryption key.";
+      return -EIO;
+    }
+
+    if (block_crypt) *block_crypt = std::move(gcm);
     return 0;
   }
 
@@ -2025,9 +2761,26 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
       return -EINVAL;
     }
 
-    auto aes = std::unique_ptr<AES_256_GCM>(new AES_256_GCM(s, s->cct));
-    aes->set_key(reinterpret_cast<const uint8_t*>(actual_key.c_str()), AES_256_KEYSIZE);
+    // Retrieve the stored nonce for decryption
+    std::string stored_nonce = get_str_attribute(attrs, RGW_ATTR_CRYPT_NONCE);
+    if (stored_nonce.size() != AES_256_GCM_NONCE_SIZE) {
+      ldpp_dout(s, 5) << "ERROR: Missing or invalid nonce for AES256-GCM decryption" << dendl;
+      actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+      s->err.message = "Object encryption metadata is corrupted.";
+      return -EIO;
+    }
+
+    auto aes = AES_256_GCM_create(s, s->cct,
+                                   reinterpret_cast<const uint8_t*>(actual_key.c_str()),
+                                   AES_256_KEYSIZE,
+                                   reinterpret_cast<const uint8_t*>(stored_nonce.c_str()),
+                                   stored_nonce.size(),
+                                   part_number);
     actual_key.replace(0, actual_key.length(), actual_key.length(), '\000');
+    if (!aes) {
+      ldpp_dout(s, 5) << "ERROR: Failed to create AES-256-GCM instance for decryption" << dendl;
+      return -EIO;
+    }
     if (block_crypt) *block_crypt = std::move(aes);
 
     if (crypt_http_responses) {

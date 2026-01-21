@@ -3048,8 +3048,10 @@ int RGWPutObj_ObjStore_S3::get_encrypt_filter(
       /* We are adding to existing object.
        * We use crypto mode that configured as if we were decrypting. */
       static constexpr bool copy_source = false;
+      // Pass part_number for GCM IV derivation - ensures unique IVs across parts
       res = rgw_s3_prepare_decrypt(s, s->yield, obj->get_attrs(),
-                                   &block_crypt, &crypt_http_responses, copy_source);
+                                   &block_crypt, &crypt_http_responses, copy_source,
+                                   multipart_part_num);
       if (res == 0 && block_crypt != nullptr)
         filter->reset(new RGWPutObj_BlockEncrypt(s, s->cct, cb, std::move(block_crypt), s->yield));
     }
@@ -3058,8 +3060,9 @@ int RGWPutObj_ObjStore_S3::get_encrypt_filter(
   else
   {
     std::unique_ptr<BlockCrypt> block_crypt;
+    // Pass part_number for GCM IV derivation - ensures unique IVs across parts
     res = rgw_s3_prepare_encrypt(s, s->yield, attrs, &block_crypt,
-                                 crypt_http_responses);
+                                 crypt_http_responses, multipart_part_num);
     if (res == 0 && block_crypt != nullptr) {
       filter->reset(new RGWPutObj_BlockEncrypt(s, s->cct, cb, std::move(block_crypt), s->yield));
     }

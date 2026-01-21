@@ -2515,11 +2515,15 @@ void RGWGetObj::execute(optional_yield y)
   /* start gettorrent */
   if (get_torrent) {
     attr_iter = attrs.find(RGW_ATTR_CRYPT_MODE);
-    if (attr_iter != attrs.end() && attr_iter->second.to_str() == "SSE-C-AES256") {
-      ldpp_dout(this, 0) << "ERROR: torrents are not supported for objects "
-          "encrypted with SSE-C" << dendl;
-      op_ret = -EINVAL;
-      goto done_err;
+    if (attr_iter != attrs.end()) {
+      std::string crypt_mode = attr_iter->second.to_str();
+      // Block torrents for any SSE-C mode (SSE-C-AES256, SSE-C-AES256-GCM, etc.)
+      if (crypt_mode.compare(0, 5, "SSE-C") == 0) {
+        ldpp_dout(this, 0) << "ERROR: torrents are not supported for objects "
+            "encrypted with SSE-C" << dendl;
+        op_ret = -EINVAL;
+        goto done_err;
+      }
     }
     // read torrent info from attr
     bufferlist torrentbl;
@@ -2630,6 +2634,93 @@ void RGWGetObj::execute(optional_yield y)
     return;
   }
 
+  // For GCM encryption without compression, convert obj_size to plaintext size
+  // BEFORE range parsing. Compression already sets obj_size to plaintext if active.
+  // This must happen before range_to_ofs() so Range headers are interpreted correctly.
+  // Note: GCM modes include SSE-C-AES256-GCM, SSE-KMS-GCM, AES256-GCM, RGW-AUTO-GCM, etc.
+  if (encrypted && !need_decompress && !skip_decrypt) {
+    attr_iter = attrs.find(RGW_ATTR_CRYPT_MODE);
+    if (attr_iter != attrs.end()) {
+      std::string crypt_mode = attr_iter->second.to_str();
+      // Check if this is any GCM mode (ends with "GCM")
+      bool is_gcm = (crypt_mode.size() >= 3 &&
+                     crypt_mode.compare(crypt_mode.size() - 3, 3, "GCM") == 0);
+      if (is_gcm) {
+        // GCM: each 4096-byte plaintext chunk becomes 4112 bytes (+ 16-byte tag)
+        constexpr size_t gcm_chunk_size = 4096;
+        constexpr size_t gcm_encrypted_chunk_size = 4112;
+        constexpr size_t gcm_tag_size = 16;
+
+        // Helper lambda to convert encrypted part size to plaintext size
+        auto encrypted_to_plaintext = [&](size_t enc_size) -> size_t {
+          size_t num_complete = enc_size / gcm_encrypted_chunk_size;
+          size_t remaining = enc_size % gcm_encrypted_chunk_size;
+          size_t partial_plain = (remaining > gcm_tag_size) ? (remaining - gcm_tag_size) : 0;
+          return num_complete * gcm_chunk_size + partial_plain;
+        };
+
+        size_t encrypted_size = s->obj_size;
+        size_t plaintext_size = 0;
+
+        // Check for multipart object (has per-part encrypted sizes)
+        auto parts_iter = attrs.find(RGW_ATTR_CRYPT_PARTS);
+        if (parts_iter != attrs.end()) {
+          // Multipart: sum plaintext size of each part
+          std::vector<size_t> parts_len;
+          try {
+            auto p = parts_iter->second.cbegin();
+            decode(parts_len, p);
+            for (size_t part_enc_size : parts_len) {
+              plaintext_size += encrypted_to_plaintext(part_enc_size);
+            }
+            ldpp_dout(this, 20) << "GCM multipart (" << crypt_mode << "): "
+                                << parts_len.size() << " parts, converted obj_size from "
+                                << encrypted_size << " (encrypted) to " << plaintext_size
+                                << " (plaintext) before range parsing" << dendl;
+          } catch (const ceph::buffer::error& e) {
+            ldpp_dout(this, 1) << "GCM: failed to decode RGW_ATTR_CRYPT_PARTS, "
+                               << "falling back to single-part conversion" << dendl;
+            plaintext_size = encrypted_to_plaintext(encrypted_size);
+          }
+        } else {
+          // RGW_ATTR_CRYPT_PARTS not found - check manifest for multipart info
+          auto manifest_iter = attrs.find(RGW_ATTR_MANIFEST);
+          if (manifest_iter != attrs.end()) {
+            // Try to parse parts from manifest (handles multipart without CRYPT_PARTS attr)
+            std::vector<size_t> manifest_parts;
+            int r = RGWGetObj_BlockDecrypt::read_manifest_parts(this, manifest_iter->second,
+                                                                 manifest_parts);
+            if (r == 0 && manifest_parts.size() > 1) {
+              // Multipart from manifest - convert per-part
+              for (size_t part_enc_size : manifest_parts) {
+                plaintext_size += encrypted_to_plaintext(part_enc_size);
+              }
+              ldpp_dout(this, 20) << "GCM multipart from manifest (" << crypt_mode << "): "
+                                  << manifest_parts.size() << " parts, converted obj_size from "
+                                  << encrypted_size << " (encrypted) to " << plaintext_size
+                                  << " (plaintext) before range parsing" << dendl;
+            } else {
+              // Single-part or manifest parse failed: use continuous stream formula
+              plaintext_size = encrypted_to_plaintext(encrypted_size);
+              ldpp_dout(this, 20) << "GCM (" << crypt_mode << "): converted obj_size from "
+                                  << encrypted_size << " (encrypted) to " << plaintext_size
+                                  << " (plaintext) before range parsing" << dendl;
+            }
+          } else {
+            // No manifest: use continuous stream formula
+            plaintext_size = encrypted_to_plaintext(encrypted_size);
+            ldpp_dout(this, 20) << "GCM (" << crypt_mode << "): converted obj_size from "
+                                << encrypted_size << " (encrypted) to " << plaintext_size
+                                << " (plaintext) before range parsing" << dendl;
+          }
+        }
+
+        s->obj_size = plaintext_size;
+        s->object->set_obj_size(s->obj_size);
+      }
+    }
+  }
+
   // for range requests with obj size 0
   if (range_str && !(s->obj_size)) {
     total_len = 0;
@@ -2664,6 +2755,8 @@ void RGWGetObj::execute(optional_yield y)
   if (decrypt != nullptr) {
     filter = decrypt.get();
     filter->fixup_range(ofs_x, end_x);
+    // Note: obj_size conversion for GCM is done BEFORE range_to_ofs() to ensure
+    // Range headers are interpreted correctly. See the conversion above.
   }
   if (op_ret < 0) {
     goto done_err;

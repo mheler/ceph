@@ -565,6 +565,7 @@ void RGWZoneGroupPlacementTier::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("tier_type", tier_type, obj);
   JSONDecoder::decode_json("storage_class", storage_class, obj);
   JSONDecoder::decode_json("retain_head_object", retain_head_object, obj);
+  JSONDecoder::decode_json("retain_versioned_head", retain_versioned_head, obj);
   if (is_tier_type_s3()) {
     JSONDecoder::decode_json("s3", t.s3, obj);
     if (t.s3.delete_with_head_object) {
@@ -640,6 +641,7 @@ void RGWZoneGroupPlacementTier::dump(Formatter *f) const
   encode_json("tier_type", tier_type, f);
   encode_json("storage_class", storage_class, f);
   encode_json("retain_head_object", retain_head_object, f);
+  encode_json("retain_versioned_head", retain_versioned_head, f);
   if (is_tier_type_s3()) {
     encode_json("s3", t.s3, f);
   }
@@ -1962,6 +1964,14 @@ int RGWZoneGroupPlacementTier::update_params(const JSONFormattable& config)
       retain_head_object = false;
     }
   }
+  if (config.exists("retain_versioned_head")) {
+    string s = config["retain_versioned_head"];
+    if (s == "true") {
+      retain_versioned_head = true;
+    } else {
+      retain_versioned_head = false;
+    }
+  }
   if (config.exists("allow_read_through")) {
     string s = config["allow_read_through"];
     if (s == "true") {
@@ -1998,6 +2008,9 @@ int RGWZoneGroupPlacementTier::clear_params(const JSONFormattable& config)
 {
   if (config.exists("retain_head_object")) {
     retain_head_object = false;
+  }
+  if (config.exists("retain_versioned_head")) {
+    retain_versioned_head = false;
   }
   if (config.exists("allow_read_through")) {
     allow_read_through = false;

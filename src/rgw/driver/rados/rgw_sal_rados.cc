@@ -3224,6 +3224,7 @@ int RadosObject::transition_to_cloud(Bucket* bucket,
   tier_ctx.multipart_sync_threshold = rtier->get_rt().t.s3.multipart_sync_threshold;
   tier_ctx.storage_class = tier->get_storage_class();
   tier_ctx.location_constraint = rtier->get_rt().t.s3.location_constraint;
+  tier_ctx.retain_versioned_head = rtier->get_rt().retain_versioned_head;
 
   ldpp_dout(dpp, 0) << "Transitioning object(" << o.key << ") to the cloud endpoint(" << endpoint << ")" << dendl;
 

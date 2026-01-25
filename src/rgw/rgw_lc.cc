@@ -1312,10 +1312,16 @@ public:
 
   int transition_obj_to_cloud(lc_op_ctx& oc, optional_yield y) {
     int ret{0};
-    /* If CurrentVersion object & bucket has versioning enabled, remove it &
-     * create delete marker */
-    bool delete_object = (!oc.tier->retain_head_object() ||
-                     (oc.o.is_current() && oc.bucket->versioning_enabled()));
+    /* Determine whether to delete the local object after cloud transition.
+     * For current versioned objects, use retain_versioned_head setting.
+     * For non-versioned or non-current objects, use retain_head_object setting.
+     */
+    bool delete_object;
+    if (oc.o.is_current() && oc.bucket->versioning_enabled()) {
+      delete_object = !oc.tier->retain_versioned_head();
+    } else {
+      delete_object = !oc.tier->retain_head_object();
+    }
 
     /* notifications */
     auto& bucket = oc.bucket;

@@ -41,6 +41,7 @@
 #include "rgw_aio_throttle.h"
 #include "rgw_bucket.h"
 #include "rgw_bucket_logging.h"
+#include "rgw_crypt.h"
 #include "rgw_bl_rados.h"
 #include "rgw_lc.h"
 #include "rgw_lc_tier.h"
@@ -4343,6 +4344,15 @@ int RadosMultipartUpload::complete(const DoutPrefixProvider *dpp,
   auto etags_iter = part_etags.begin();
   rgw::sal::Attrs& attrs = target_obj->get_attrs();
 
+  // Check if this is GCM encryption to track plaintext size
+  bool is_gcm = false;
+  uint64_t plaintext_ofs = 0;
+  auto mode_iter = attrs.find(RGW_ATTR_CRYPT_MODE);
+  if (mode_iter != attrs.end()) {
+    std::string crypt_mode = mode_iter->second.to_str();
+    is_gcm = is_gcm_mode(crypt_mode);
+  }
+
   do {
     ret = list_parts(dpp, cct, max_parts, marker, &marker, &truncated, y);
     if (ret == -ENOENT) {
@@ -4458,6 +4468,11 @@ int RadosMultipartUpload::complete(const DoutPrefixProvider *dpp,
 
       ofs += obj_part.size;
       accounted_size += obj_part.accounted_size;
+
+      // Track plaintext size for GCM encryption
+      if (is_gcm) {
+        plaintext_ofs += gcm_encrypted_to_plaintext_size(obj_part.size);
+      }
     }
   } while (truncated);
   hash.Final((unsigned char *)final_etag);
@@ -4494,6 +4509,13 @@ int RadosMultipartUpload::complete(const DoutPrefixProvider *dpp,
     bufferlist tmp;
     encode(cs_info, tmp);
     attrs[RGW_ATTR_COMPRESSION] = tmp;
+  }
+
+  // For GCM encryption: store total plaintext size (calculated during loop)
+  if (is_gcm) {
+    bufferlist bl;
+    bl.append(std::to_string(plaintext_ofs));
+    attrs[RGW_ATTR_CRYPT_PLAINTEXT_SIZE] = std::move(bl);
   }
 
   target_obj->set_atomic(true);

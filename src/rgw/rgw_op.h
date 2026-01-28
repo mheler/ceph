@@ -458,6 +458,10 @@ protected:
   // PartsCount response when partNumber is specified
   std::optional<int> multipart_parts_count;
 
+  // For GCM encryption: preserve original encrypted size before plaintext conversion
+  // Used by decrypt filter for range clamping. For non-GCM modes, equals s->obj_size.
+  off_t encrypted_obj_size{0};
+
   int init_common();
 public:
   RGWGetObj() {
@@ -2910,4 +2914,5 @@ int get_decrypt_filter(
   std::map<std::string, bufferlist>& attrs,
   bufferlist* manifest_bl,
   std::map<std::string, std::string>* crypt_http_responses,
-  bool copy_source);
+  bool copy_source,
+  off_t encrypted_total_size = 0);

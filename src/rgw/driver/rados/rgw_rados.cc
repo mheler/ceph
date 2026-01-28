@@ -36,6 +36,7 @@
 #include "rgw_rest_conn.h"
 #include "rgw_cr_rados.h"
 #include "rgw_cr_rest.h"
+#include "rgw_crypt.h"
 #include "rgw_datalog.h"
 #include "rgw_putobj_processor.h"
 #include "rgw_lc_tier.h"
@@ -3474,8 +3475,39 @@ int RGWRados::Object::Write::_do_write_meta(uint64_t size, uint64_t accounted_si
     ldpp_dout(rctx.dpp, 0) << "ERROR: complete_atomic_modification returned r=" << r << dendl;
   }
 
+  // For GCM encryption: use plaintext size for bucket index
+  uint64_t index_size, index_accounted_size;
+  index_size = size;
+  index_accounted_size = accounted_size;
+  {
+    auto plaintext_attr = attrs.find(RGW_ATTR_CRYPT_PLAINTEXT_SIZE);
+    if (plaintext_attr != attrs.end()) {
+      try {
+        uint64_t plaintext_size = std::stoull(plaintext_attr->second.to_str());
+        index_size = plaintext_size;
+        index_accounted_size = plaintext_size;
+      } catch (const std::exception& e) {
+        ldpp_dout(rctx.dpp, 0) << "ERROR: invalid RGW_ATTR_CRYPT_PLAINTEXT_SIZE: "
+                               << e.what() << dendl;
+        // Fall back to encrypted size
+      }
+    } else {
+      // Fallback for GCM when attr is missing (zero-byte or chunked uploads)
+      auto mode_attr = attrs.find(RGW_ATTR_CRYPT_MODE);
+      if (mode_attr != attrs.end()) {
+        std::string mode = mode_attr->second.to_str();
+        if (is_gcm_mode(mode)) {
+          index_size = gcm_encrypted_to_plaintext_size(size);
+          index_accounted_size = index_size;
+          ldpp_dout(rctx.dpp, 20) << "GCM: calculated plaintext size " << index_size
+                                  << " from encrypted " << size << dendl;
+        }
+      }
+    }
+  }
+
   tracepoint(rgw_rados, complete_enter, req_id.c_str());
-  r = index_op->complete(rctx.dpp, poolid, epoch, size, accounted_size,
+  r = index_op->complete(rctx.dpp, poolid, epoch, index_size, index_accounted_size,
                         meta.set_mtime, etag, content_type,
                         storage_class, meta.owner,
 			 meta.category, meta.remove_objs, rctx.y,
@@ -5089,6 +5121,8 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   src_attrs.erase(RGW_ATTR_CRYPT_KEYID);
   src_attrs.erase(RGW_ATTR_CRYPT_KEYMD5);
   src_attrs.erase(RGW_ATTR_CRYPT_DATAKEY);
+  src_attrs.erase(RGW_ATTR_CRYPT_NONCE);
+  src_attrs.erase(RGW_ATTR_CRYPT_PLAINTEXT_SIZE);
 
   set_copy_attrs(src_attrs, attrs, attrs_mod);
   attrs.erase(RGW_ATTR_ID_TAG);

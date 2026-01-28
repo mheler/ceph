@@ -1922,12 +1922,19 @@ int RGWGetObj::read_user_manifest_part(rgw::sal::Bucket* bucket,
   }
   else
   {
-    if (part->get_size() != ent.meta.size) {
+    // For GCM: on-disk size includes auth tags, but bucket index stores plaintext size.
+    // Convert encrypted size to plaintext for comparison.
+    uint64_t obj_size = part->get_size();
+    uint64_t decrypted_size = 0;
+    if (rgw_get_gcm_decrypted_size(this, part->get_attrs(), obj_size, &decrypted_size)) {
+      obj_size = decrypted_size;
+    }
+    if (obj_size != ent.meta.size) {
       // hmm.. something wrong, object not as expected, abort!
-      ldpp_dout(this, 0) << "ERROR: expected obj_size=" << part->get_size()
+      ldpp_dout(this, 0) << "ERROR: expected obj_size=" << obj_size
           << ", actual read size=" << ent.meta.size << dendl;
       return -EIO;
-	  }
+    }
   }
 
   op_ret = rgw_policy_from_attrset(s, s->cct, part->get_attrs(), &obj_policy);
@@ -2450,6 +2457,27 @@ static inline void rgw_cond_decode_objtags(
   }
 }
 
+/*
+ * Calculate the correct object size for GCM when used in range/content-length
+ * handling. If compression is present, stay in the compressed domain and avoid
+ * using ORIGINAL_SIZE.
+ */
+static bool rgw_calc_gcm_obj_size(const DoutPrefixProvider* dpp,
+                                  const std::map<std::string, bufferlist>& attrs,
+                                  uint64_t encrypted_size,
+                                  bool has_compression,
+                                  uint64_t* out_size)
+{
+  if (!out_size) {
+    return false;
+  }
+  if (!has_compression &&
+      rgw_get_gcm_original_size(dpp, attrs, out_size)) {
+    return true;
+  }
+  return rgw_get_gcm_decrypted_size(dpp, attrs, encrypted_size, out_size);
+}
+
 void RGWGetObj::execute(optional_yield y)
 {
   bufferlist bl;
@@ -2499,6 +2527,9 @@ void RGWGetObj::execute(optional_yield y)
   op_ret = read_op->prepare(s->yield, this);
   version_id = s->object->get_instance();
   s->obj_size = s->object->get_size();
+  // Preserve encrypted size before compression/decompression modifies s->obj_size
+  // (needed for GCM decrypt filter range clamping)
+  encrypted_obj_size = s->obj_size;
   attrs = s->object->get_attrs();
   multipart_parts_count = read_op->params.parts_count;
   if (op_ret < 0)
@@ -2515,11 +2546,15 @@ void RGWGetObj::execute(optional_yield y)
   /* start gettorrent */
   if (get_torrent) {
     attr_iter = attrs.find(RGW_ATTR_CRYPT_MODE);
-    if (attr_iter != attrs.end() && attr_iter->second.to_str() == "SSE-C-AES256") {
-      ldpp_dout(this, 0) << "ERROR: torrents are not supported for objects "
-          "encrypted with SSE-C" << dendl;
-      op_ret = -EINVAL;
-      goto done_err;
+    if (attr_iter != attrs.end()) {
+      std::string crypt_mode = attr_iter->second.to_str();
+      // Block torrents for any SSE-C mode (SSE-C-AES256, SSE-C-AES256-GCM, etc.)
+      if (crypt_mode.compare(0, 5, "SSE-C") == 0) {
+        ldpp_dout(this, 0) << "ERROR: torrents are not supported for objects "
+            "encrypted with SSE-C" << dendl;
+        op_ret = -EINVAL;
+        goto done_err;
+      }
     }
     // read torrent info from attr
     bufferlist torrentbl;
@@ -2630,6 +2665,24 @@ void RGWGetObj::execute(optional_yield y)
     return;
   }
 
+  /**
+   * For GCM encryption: use original size for Content-Length/ranges.
+   * Key rule: compression active => never use GCM decrypted fallback.
+   * Use encrypted_obj_size (saved earlier) as the raw encrypted input.
+   */
+  if (encrypted && !skip_decrypt) {
+    if (need_decompress) {
+      // compression active: cs_info.orig_size already set obj_size
+    } else {
+      // no compression: try ORIGINAL_SIZE, then decrypted fallback
+      uint64_t size = 0;
+      if (rgw_calc_gcm_obj_size(this, attrs, encrypted_obj_size, false, &size)) {
+        s->obj_size = size;
+        s->object->set_obj_size(s->obj_size);
+      }
+    }
+  }
+
   // for range requests with obj size 0
   if (range_str && !(s->obj_size)) {
     total_len = 0;
@@ -2644,7 +2697,9 @@ void RGWGetObj::execute(optional_yield y)
 
   ofs_x = ofs;
   end_x = end;
-  filter->fixup_range(ofs_x, end_x);
+  if (!encrypted || skip_decrypt) {
+    filter->fixup_range(ofs_x, end_x);
+  }
 
   /* Check whether the object has expired. Swift API documentation
    * stands that we should return 404 Not Found in such case. */
@@ -2664,6 +2719,8 @@ void RGWGetObj::execute(optional_yield y)
   if (decrypt != nullptr) {
     filter = decrypt.get();
     filter->fixup_range(ofs_x, end_x);
+    // Note: obj_size conversion for GCM is done BEFORE range_to_ofs() to ensure
+    // Range headers are interpreted correctly. See the conversion above.
   }
   if (op_ret < 0) {
     goto done_err;
@@ -4316,6 +4373,7 @@ int RGWPutObj::get_data(const off_t fst, const off_t lst, bufferlist& bl)
     return ret;
 
   obj_size = obj->get_size();
+  uint64_t encrypted_size = obj_size; // capture before any mutation
 
   bool need_decompress;
   op_ret = rgw_compression_info_from_attrset(obj->get_attrs(), need_decompress, cs_info);
@@ -4342,6 +4400,23 @@ int RGWPutObj::get_data(const off_t fst, const off_t lst, bufferlist& bl)
   }
   if (op_ret < 0) {
     return op_ret;
+  }
+
+  /**
+   * For GCM encryption: adjust obj_size for range validation.
+   * Key rule: compression active => never use GCM decrypted fallback.
+   */
+  if (decrypt != nullptr) {
+    if (need_decompress) {
+      // compression active: cs_info.orig_size already set obj_size
+    } else {
+      // no compression: try ORIGINAL_SIZE, then decrypted fallback (safe)
+      uint64_t size = 0;
+      if (rgw_calc_gcm_obj_size(this, obj->get_attrs(), encrypted_size,
+                                obj->get_attrs().count(RGW_ATTR_COMPRESSION), &size)) {
+        obj_size = size;
+      }
+    }
   }
 
   ret = obj->range_to_ofs(obj_size, new_ofs, new_end);
@@ -5790,27 +5865,47 @@ public:
     }
 
     bool src_encrypted = s->src_object->get_attrs().count(RGW_ATTR_CRYPT_MODE);
-    if (need_decompress && !src_encrypted) {
-      obj_size = decompress_info.orig_size;
-      s->src_object->set_obj_size(obj_size);
+    // Preserve encrypted size for decrypt range clamping before any plaintext conversion.
+    off_t encrypted_total_size = obj_size;
+
+    // Create decompress filter if source is compressed.
+    // Must be created BEFORE decrypt so the chain is: decrypt → decompress → cb
+    if (need_decompress) {
       static constexpr bool partial_content = false;
       decompress.emplace(s->cct, &decompress_info, partial_content, filter);
       filter = &*decompress;
-      end_x = obj_size;
     }
 
     // decrypt
     if (src_encrypted) {
       auto attr_iter = s->src_object->get_attrs().find(RGW_ATTR_MANIFEST);
       static constexpr bool copy_source = true;
+
+      // part_num=0 for copy source (full object read)
       ret = get_decrypt_filter(&decrypt, filter, s, s->src_object->get_attrs(),
                                attr_iter != s->src_object->get_attrs().end() ? &attr_iter->second : nullptr,
-                               nullptr, copy_source);
+                               nullptr, copy_source, 0, encrypted_total_size);
       if (ret < 0) {
         return ret;
       }
       if (decrypt != nullptr) {
         filter = decrypt.get();
+      }
+    }
+
+    // Set obj_size to the final output size (plaintext) for range handling.
+    if (need_decompress) {
+      obj_size = decompress_info.orig_size;
+      s->src_object->set_obj_size(obj_size);
+      end_x = obj_size;
+    } else if (src_encrypted) {
+      uint64_t decrypted_size = 0;
+      const auto& src_attrs = s->src_object->get_attrs();
+      if (rgw_calc_gcm_obj_size(dpp, src_attrs, encrypted_total_size,
+                                src_attrs.count(RGW_ATTR_COMPRESSION), &decrypted_size)) {
+        obj_size = decrypted_size;
+        s->src_object->set_obj_size(obj_size);
+        end_x = obj_size;
       }
     }
 
@@ -5898,6 +5993,18 @@ public:
           << ", orig_size=" << cs_info.orig_size
           << ", compressor_message=" << cs_info.compressor_message
           << ", blocks=" << cs_info.blocks.size() << dendl;
+    }
+
+    // Copy path: ensure GCM ORIGINAL_SIZE matches copied payload size.
+    // If it doesn't, stale CRYPT_PARTS must be dropped.
+    const auto mode = get_str_attribute(attrs, RGW_ATTR_CRYPT_MODE);
+    if (is_gcm_mode(mode)) {
+      uint64_t existing = 0;
+      if (!rgw_get_gcm_original_size(s, attrs, &existing) ||
+          existing != obj_size) {
+        set_attr(attrs, RGW_ATTR_CRYPT_ORIGINAL_SIZE, std::to_string(obj_size));
+        attrs.erase(RGW_ATTR_CRYPT_PARTS);
+      }
     }
   }
 };
@@ -9964,11 +10071,15 @@ int get_decrypt_filter(
   std::map<std::string, bufferlist>& attrs,
   bufferlist* manifest_bl,
   std::map<std::string, std::string>* crypt_http_responses,
-  bool copy_source)
+  bool copy_source,
+  uint32_t part_num,
+  off_t encrypted_total_size,
+  const rgw_crypt_src_identity* src_identity)
 {
   std::unique_ptr<BlockCrypt> block_crypt;
   int res = rgw_s3_prepare_decrypt(s, s->yield, attrs, &block_crypt,
-                                   crypt_http_responses, copy_source);
+                                   crypt_http_responses, copy_source, part_num,
+                                   src_identity);
   if (res < 0) {
     return res;
   }
@@ -9979,6 +10090,25 @@ int get_decrypt_filter(
   // in case of a multipart upload, we need to know the part lengths to
   // correctly decrypt across part boundaries
   std::vector<size_t> parts_len;
+
+  // Extract starting part number: prefer manifest, fall back to part_num for part reads
+  uint32_t starting_part_num = 0;
+  if (manifest_bl) {
+    starting_part_num = RGWGetObj_BlockDecrypt::read_manifest_starting_part(s, *manifest_bl);
+    /*
+     * Sanity check: for multipart part reads, the manifest's part number should
+     * match the requested part number. A mismatch could indicate manifest
+     * corruption or a bug in the part redirect logic, which would cause GCM
+     * decryption to fail.
+     */
+    if (part_num > 0 && starting_part_num > 0 && starting_part_num != part_num) {
+      ldpp_dout(s, 1) << "WARNING: manifest starting_part_num " << starting_part_num
+                      << " != requested part_num " << part_num
+                      << " - GCM decryption may fail" << dendl;
+    }
+  } else if (part_num > 0) {
+    starting_part_num = part_num;
+  }
 
   // for replicated objects, the original part lengths are preserved in an xattr
   if (auto i = attrs.find(RGW_ATTR_CRYPT_PARTS); i != attrs.end()) {
@@ -9999,8 +10129,29 @@ int get_decrypt_filter(
     }
   }
 
+  /*
+   * If encrypted_total_size not provided, derive from parts_len or CRYPT_ORIGINAL_SIZE.
+   * Only do this for size-expanding ciphers (GCM). For compressed objects, avoid
+   * converting plaintext size to encrypted size because the domains differ.
+   */
+  if (encrypted_total_size == 0 &&
+      block_crypt->get_block_size() != block_crypt->get_encrypted_block_size()) {
+    if (!parts_len.empty()) {
+      for (size_t part_len : parts_len) {
+        encrypted_total_size += part_len;
+      }
+    } else if (!attrs.count(RGW_ATTR_COMPRESSION)) {
+      uint64_t orig_size = 0;
+      if (rgw_get_gcm_original_size(s, attrs, &orig_size)) {
+        encrypted_total_size = gcm_plaintext_to_encrypted_size(orig_size);
+      }
+    }
+  }
+
+  const bool has_compression = attrs.count(RGW_ATTR_COMPRESSION);
   *filter = std::make_unique<RGWGetObj_BlockDecrypt>(
       s, s->cct, cb, std::move(block_crypt),
-      std::move(parts_len), s->yield);
+      std::move(parts_len), starting_part_num, encrypted_total_size,
+      has_compression, s->yield);
   return 0;
 }

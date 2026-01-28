@@ -26,6 +26,15 @@ using namespace std;
 
 
 std::unique_ptr<BlockCrypt> AES_256_CBC_create(const DoutPrefixProvider *dpp, CephContext* cct, const uint8_t* key, size_t len);
+bool AES_256_GCM_derive_object_key(BlockCrypt* block_crypt,
+                                    const uint8_t* user_key,
+                                    size_t key_len,
+                                    const std::string& bucket,
+                                    const std::string& object,
+                                    const std::string& version_id,
+                                    const std::string& user_context,
+                                    uint32_t part_number,
+                                    const std::string& domain = "SSE-C-GCM");
 
 class ut_get_sink : public RGWGetObj_Filter {
   std::stringstream sink;
@@ -810,6 +819,576 @@ TEST(TestRGWCrypto, verify_Encrypt_Decrypt)
     delete[] test_in;
   }
   while (test_size < 20000);
+}
+
+
+// GCM Tests
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_identity)
+{
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  // Create some input for encryption
+  const off_t test_range = 1024*1024;
+  buffer::ptr buf(test_range);
+  char* p = buf.c_str();
+  for(size_t i = 0; i < buf.length(); i++)
+    p[i] = i + i*i + (i >> 2);
+
+  bufferlist input;
+  input.append(buf);
+
+  for (unsigned int step : {1, 2, 3, 5, 7, 11, 13, 17})
+  {
+    // Make some random key
+    uint8_t key[32];
+    for(size_t i=0;i<sizeof(key);i++)
+      key[i]=i*step;
+
+    auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+    ASSERT_NE(aes.get(), nullptr);
+
+    size_t block_size = aes->get_block_size();
+    ASSERT_EQ(block_size, 4096u);
+
+    for (size_t r = 97; r < 123 ; r++)
+    {
+      off_t begin = (r*r*r*r*r % test_range);
+      begin = begin - begin % block_size;
+      off_t end = begin + r*r*r*r*r*r*r % (test_range - begin);
+      if (r % 3)
+        end = end - end % block_size;
+      off_t offset = r*r*r*r*r*r*r*r % (1000*1000*1000);
+      offset = offset - offset % block_size;
+
+      ASSERT_EQ(begin % block_size, 0u);
+      ASSERT_LE(end, test_range);
+      ASSERT_EQ(offset % block_size, 0u);
+
+      bufferlist encrypted;
+      ASSERT_TRUE(aes->encrypt(input, begin, end - begin, encrypted, offset, null_yield));
+
+      // GCM adds 16-byte tag per 4096-byte chunk
+      size_t expected_encrypted_size = end - begin;
+      size_t num_chunks = (end - begin + block_size - 1) / block_size;
+      expected_encrypted_size += num_chunks * 16;  // 16 bytes tag per chunk
+      ASSERT_EQ(encrypted.length(), expected_encrypted_size);
+
+      bufferlist decrypted;
+      ASSERT_TRUE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, offset, null_yield));
+
+      ASSERT_EQ(decrypted.length(), end - begin);
+      ASSERT_EQ(std::string_view(input.c_str() + begin, end - begin),
+                std::string_view(decrypted.c_str(), end - begin) );
+    }
+  }
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_chunk_sizes)
+{
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  uint8_t key[32];
+  for(size_t i=0;i<sizeof(key);i++)
+    key[i]=i*3;
+
+  auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes.get(), nullptr);
+
+  // Test various sizes to verify chunk + tag handling
+  for (size_t size : {0, 1, 16, 4095, 4096, 4097, 8192, 10000})
+  {
+    buffer::ptr buf(size);
+    char* p = buf.c_str();
+    for(size_t i = 0; i < size; i++)
+      p[i] = i & 0xFF;
+
+    bufferlist input;
+    input.append(buf);
+
+    bufferlist encrypted;
+    ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+    // Calculate expected encrypted size (plaintext + tags)
+    size_t num_chunks = (size + 4095) / 4096;  // Round up
+    if (size == 0) num_chunks = 0;
+    size_t expected_size = size + (num_chunks * 16);
+    ASSERT_EQ(encrypted.length(), expected_size);
+
+    bufferlist decrypted;
+    ASSERT_TRUE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+    ASSERT_EQ(decrypted.length(), size);
+
+    if (size > 0) {
+      ASSERT_EQ(std::string_view(input.c_str(), size),
+                std::string_view(decrypted.c_str(), size));
+    }
+  }
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_size_conversion)
+{
+  // Test the inverse calculation: encrypted size -> plaintext size
+  // This is used in rgw_op.cc and rgw_rados.cc for size accounting
+  constexpr uint64_t gcm_chunk = 4096;
+  constexpr uint64_t gcm_encrypted_chunk = 4112;  // 4096 + 16 tag
+  constexpr uint64_t gcm_tag = 16;
+
+  // Helper lambda matching the code in rgw_op.cc/rgw_rados.cc
+  auto encrypted_to_plaintext = [&](uint64_t enc_size) -> uint64_t {
+    uint64_t full_chunks = enc_size / gcm_encrypted_chunk;
+    uint64_t remainder = enc_size % gcm_encrypted_chunk;
+    uint64_t partial = (remainder > gcm_tag) ? (remainder - gcm_tag) : 0;
+    return full_chunks * gcm_chunk + partial;
+  };
+
+  // Helper lambda for forward calculation (plaintext -> encrypted)
+  auto plaintext_to_encrypted = [&](uint64_t plain_size) -> uint64_t {
+    if (plain_size == 0) return 0;
+    uint64_t num_chunks = (plain_size + gcm_chunk - 1) / gcm_chunk;
+    return plain_size + (num_chunks * gcm_tag);
+  };
+
+  // Test roundtrip: plaintext -> encrypted -> plaintext
+  for (uint64_t plain : {0UL, 1UL, 16UL, 100UL, 4095UL, 4096UL, 4097UL,
+                         8192UL, 10000UL, 1000000UL}) {
+    uint64_t enc = plaintext_to_encrypted(plain);
+    uint64_t recovered = encrypted_to_plaintext(enc);
+    ASSERT_EQ(plain, recovered)
+      << "Roundtrip failed for plaintext=" << plain
+      << " encrypted=" << enc << " recovered=" << recovered;
+  }
+
+  // Test specific encrypted sizes directly
+  // Zero-byte object: encrypted = 0 (no data, no tag)
+  ASSERT_EQ(encrypted_to_plaintext(0), 0UL);
+
+  // Single tag only (16 bytes) -> 0 plaintext (edge case for zero-byte with tag)
+  ASSERT_EQ(encrypted_to_plaintext(16), 0UL);
+
+  // One full chunk: 4112 bytes -> 4096 plaintext
+  ASSERT_EQ(encrypted_to_plaintext(4112), 4096UL);
+
+  // Two full chunks: 8224 bytes -> 8192 plaintext
+  ASSERT_EQ(encrypted_to_plaintext(8224), 8192UL);
+
+  // Partial chunk: 100 bytes encrypted -> 84 plaintext (100 - 16 tag)
+  ASSERT_EQ(encrypted_to_plaintext(100), 84UL);
+
+  // One chunk + partial: 4112 + 100 = 4212 -> 4096 + 84 = 4180
+  ASSERT_EQ(encrypted_to_plaintext(4212), 4180UL);
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_tag_verification)
+{
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  uint8_t key[32];
+  for(size_t i=0;i<sizeof(key);i++)
+    key[i]=i*7;
+
+  auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes.get(), nullptr);
+
+  const size_t size = 8192;  // 2 chunks
+  buffer::ptr buf(size);
+  char* p = buf.c_str();
+  for(size_t i = 0; i < size; i++)
+    p[i] = i & 0xFF;
+
+  bufferlist input;
+  input.append(buf);
+
+  bufferlist encrypted;
+  ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+  // Corrupt the ciphertext
+  char* enc_p = encrypted.c_str();
+  enc_p[100] ^= 0xFF;
+
+  bufferlist decrypted;
+  // Decryption should fail due to tag mismatch
+  ASSERT_FALSE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_nonce_uniqueness)
+{
+  // This test verifies the MinIO-style per-object random nonce mechanism:
+  // 1. Each GCM instance gets a unique random nonce
+  // 2. Decryption with wrong nonce fails
+  // 3. Decryption with correct nonce succeeds
+
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  uint8_t key[32];
+  for(size_t i=0;i<sizeof(key);i++)
+    key[i]=i*11;
+
+  const size_t size = 4096;
+  buffer::ptr buf(size);
+  char* p = buf.c_str();
+  for(size_t i = 0; i < size; i++)
+    p[i] = i & 0xFF;
+
+  bufferlist input;
+  input.append(buf);
+
+  // Create first instance - auto-generates random nonce
+  auto aes1(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes1.get(), nullptr);
+
+  bufferlist encrypted1;
+  ASSERT_TRUE(aes1->encrypt(input, 0, size, encrypted1, 0, null_yield));
+
+  // Create second instance with different random nonce
+  auto aes2(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes2.get(), nullptr);
+
+  // Try to decrypt data from aes1 with aes2 - should FAIL
+  // (different nonces, even with same key)
+  bufferlist decrypted_wrong;
+  ASSERT_FALSE(aes2->decrypt(encrypted1, 0, encrypted1.length(), decrypted_wrong, 0, null_yield));
+
+  // Decrypt with original instance - should succeed
+  bufferlist decrypted_correct;
+  ASSERT_TRUE(aes1->decrypt(encrypted1, 0, encrypted1.length(), decrypted_correct, 0, null_yield));
+  ASSERT_EQ(decrypted_correct.length(), size);
+  ASSERT_EQ(std::string_view(input.c_str(), size),
+            std::string_view(decrypted_correct.c_str(), size));
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_nonce_restore)
+{
+  // This test simulates the encrypt/decrypt flow with stored nonce:
+  // 1. Encrypt with auto-generated nonce
+  // 2. Extract nonce (would be stored in RGW_ATTR_CRYPT_NONCE)
+  // 3. Create new instance with restored nonce
+  // 4. Decrypt successfully
+
+  const NoDoutPrefix no_dpp(g_ceph_context, dout_subsys);
+  uint8_t key[32];
+  for(size_t i=0;i<sizeof(key);i++)
+    key[i]=i*13;
+
+  const size_t size = 8192;
+  buffer::ptr buf(size);
+  char* p = buf.c_str();
+  for(size_t i = 0; i < size; i++)
+    p[i] = (i * 7) & 0xFF;
+
+  bufferlist input;
+  input.append(buf);
+
+  // Simulate encryption path
+  auto aes_encrypt(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes_encrypt.get(), nullptr);
+
+  bufferlist encrypted;
+  ASSERT_TRUE(aes_encrypt->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+  // Extract nonce (simulates storing to RGW_ATTR_CRYPT_NONCE)
+  std::string stored_nonce = AES_256_GCM_get_nonce(aes_encrypt.get());
+  ASSERT_EQ(stored_nonce.size(), AES_256_GCM_NONCE_SIZE);
+
+  // Release encryption instance (simulates different request)
+  aes_encrypt.reset();
+
+  // Simulate decryption path with restored nonce
+  auto aes_decrypt(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32,
+                                       reinterpret_cast<const uint8_t*>(stored_nonce.c_str()),
+                                       stored_nonce.size()));
+  ASSERT_NE(aes_decrypt.get(), nullptr);
+
+  bufferlist decrypted;
+  ASSERT_TRUE(aes_decrypt->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+
+  ASSERT_EQ(decrypted.length(), size);
+  ASSERT_EQ(std::string_view(input.c_str(), size),
+            std::string_view(decrypted.c_str(), size));
+}
+
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_key_derivation_different_objects)
+{
+  // Different bucket/object should produce different derived keys
+  // (verified by different ciphertexts for same plaintext)
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t user_key[32];
+  for (size_t i = 0; i < sizeof(user_key); i++) user_key[i] = i;
+
+  const std::string plaintext = "test data for key derivation";
+
+  // Create two instances with same user key but different object identity
+  auto aes1(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32));
+  ASSERT_NE(aes1.get(), nullptr);
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes1.get(), user_key, 32,
+                                             "bucket1", "object1", "", "", 0));
+
+  auto aes2(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32));
+  ASSERT_NE(aes2.get(), nullptr);
+  // Use same nonce for comparison
+  std::string nonce1 = AES_256_GCM_get_nonce(aes1.get());
+  auto aes2_with_nonce(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32,
+                                           reinterpret_cast<const uint8_t*>(nonce1.c_str()),
+                                           nonce1.size()));
+  ASSERT_NE(aes2_with_nonce.get(), nullptr);
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes2_with_nonce.get(), user_key, 32,
+                                             "bucket2", "object2", "", "", 0));
+
+  bufferlist input;
+  input.append(plaintext);
+
+  bufferlist encrypted1, encrypted2;
+  ASSERT_TRUE(aes1->encrypt(input, 0, input.length(), encrypted1, 0, null_yield));
+  ASSERT_TRUE(aes2_with_nonce->encrypt(input, 0, input.length(), encrypted2, 0, null_yield));
+
+  // Different object identity should produce different ciphertext
+  ASSERT_NE(std::string_view(encrypted1.c_str(), encrypted1.length()),
+            std::string_view(encrypted2.c_str(), encrypted2.length()));
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_key_derivation_same_object)
+{
+  // Same bucket/object/version should produce same derived key
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t user_key[32];
+  for (size_t i = 0; i < sizeof(user_key); i++) user_key[i] = i;
+
+  const std::string plaintext = "test data for key derivation";
+
+  // Create instance and encrypt
+  auto aes1(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32));
+  ASSERT_NE(aes1.get(), nullptr);
+  std::string nonce = AES_256_GCM_get_nonce(aes1.get());
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes1.get(), user_key, 32,
+                                             "mybucket", "myobject", "v1", "", 0));
+
+  bufferlist input;
+  input.append(plaintext);
+  bufferlist encrypted;
+  ASSERT_TRUE(aes1->encrypt(input, 0, input.length(), encrypted, 0, null_yield));
+
+  // Create second instance with same parameters and decrypt
+  auto aes2(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32,
+                                reinterpret_cast<const uint8_t*>(nonce.c_str()),
+                                nonce.size()));
+  ASSERT_NE(aes2.get(), nullptr);
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes2.get(), user_key, 32,
+                                             "mybucket", "myobject", "v1", "", 0));
+
+  bufferlist decrypted;
+  ASSERT_TRUE(aes2->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+  ASSERT_EQ(std::string_view(input.c_str(), input.length()),
+            std::string_view(decrypted.c_str(), decrypted.length()));
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_key_derivation_user_context)
+{
+  // Different user context should produce different derived keys
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t user_key[32];
+  for (size_t i = 0; i < sizeof(user_key); i++) user_key[i] = i;
+
+  auto aes1(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32));
+  ASSERT_NE(aes1.get(), nullptr);
+  std::string nonce = AES_256_GCM_get_nonce(aes1.get());
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes1.get(), user_key, 32,
+                                             "bucket", "object", "", "context1", 0));
+
+  auto aes2(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32,
+                                reinterpret_cast<const uint8_t*>(nonce.c_str()),
+                                nonce.size()));
+  ASSERT_NE(aes2.get(), nullptr);
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes2.get(), user_key, 32,
+                                             "bucket", "object", "", "context2", 0));
+
+  const std::string plaintext = "test data";
+  bufferlist input;
+  input.append(plaintext);
+
+  bufferlist encrypted1, encrypted2;
+  ASSERT_TRUE(aes1->encrypt(input, 0, input.length(), encrypted1, 0, null_yield));
+  ASSERT_TRUE(aes2->encrypt(input, 0, input.length(), encrypted2, 0, null_yield));
+
+  // Different context should produce different ciphertext
+  ASSERT_NE(std::string_view(encrypted1.c_str(), encrypted1.length()),
+            std::string_view(encrypted2.c_str(), encrypted2.length()));
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_key_derivation_part_number)
+{
+  // Different part numbers should produce different derived keys
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t user_key[32];
+  for (size_t i = 0; i < sizeof(user_key); i++) user_key[i] = i;
+
+  auto aes1(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32));
+  ASSERT_NE(aes1.get(), nullptr);
+  std::string nonce = AES_256_GCM_get_nonce(aes1.get());
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes1.get(), user_key, 32,
+                                             "bucket", "object", "", "", 1));
+
+  auto aes2(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32,
+                                reinterpret_cast<const uint8_t*>(nonce.c_str()),
+                                nonce.size()));
+  ASSERT_NE(aes2.get(), nullptr);
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes2.get(), user_key, 32,
+                                             "bucket", "object", "", "", 2));
+
+  const std::string plaintext = "test data for multipart";
+  bufferlist input;
+  input.append(plaintext);
+
+  bufferlist encrypted1, encrypted2;
+  ASSERT_TRUE(aes1->encrypt(input, 0, input.length(), encrypted1, 0, null_yield));
+  ASSERT_TRUE(aes2->encrypt(input, 0, input.length(), encrypted2, 0, null_yield));
+
+  // Different part numbers should produce different ciphertext
+  ASSERT_NE(std::string_view(encrypted1.c_str(), encrypted1.length()),
+            std::string_view(encrypted2.c_str(), encrypted2.length()));
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_key_derivation_wrong_identity_fails)
+{
+  // Decryption with wrong object identity should fail (auth tag mismatch)
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t user_key[32];
+  for (size_t i = 0; i < sizeof(user_key); i++) user_key[i] = i;
+
+  // Encrypt with bucket1/object1
+  auto aes_encrypt(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32));
+  ASSERT_NE(aes_encrypt.get(), nullptr);
+  std::string nonce = AES_256_GCM_get_nonce(aes_encrypt.get());
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes_encrypt.get(), user_key, 32,
+                                             "bucket1", "object1", "", "", 0));
+
+  const std::string plaintext = "sensitive data";
+  bufferlist input;
+  input.append(plaintext);
+  bufferlist encrypted;
+  ASSERT_TRUE(aes_encrypt->encrypt(input, 0, input.length(), encrypted, 0, null_yield));
+
+  // Try to decrypt with bucket2/object2 (wrong identity)
+  auto aes_decrypt(AES_256_GCM_create(&no_dpp, g_ceph_context, &user_key[0], 32,
+                                       reinterpret_cast<const uint8_t*>(nonce.c_str()),
+                                       nonce.size()));
+  ASSERT_NE(aes_decrypt.get(), nullptr);
+  ASSERT_TRUE(AES_256_GCM_derive_object_key(aes_decrypt.get(), user_key, 32,
+                                             "bucket2", "object2", "", "", 0));
+
+  bufferlist decrypted;
+  // Decryption should fail due to authentication tag mismatch
+  ASSERT_FALSE(aes_decrypt->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_chunk_reorder_detection)
+{
+  // Verify that swapping chunk positions is detected via AAD
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t key[32];
+  for (size_t i = 0; i < sizeof(key); i++) key[i] = i * 7;
+
+  auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes.get(), nullptr);
+
+  // Create 2 chunks of data (8192 bytes = 2 x 4096)
+  const size_t size = 8192;
+  buffer::ptr buf(size);
+  char* p = buf.c_str();
+  for (size_t i = 0; i < size; i++) p[i] = i & 0xFF;
+
+  bufferlist input;
+  input.append(buf);
+
+  bufferlist encrypted;
+  ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+  // Encrypted layout: [chunk0_cipher(4096)][tag0(16)][chunk1_cipher(4096)][tag1(16)]
+  // Total: 8192 + 32 = 8224 bytes
+  ASSERT_EQ(encrypted.length(), 8224u);
+
+  // Swap the two encrypted chunks (including their tags)
+  buffer::ptr enc_copy(encrypted.length());
+  encrypted.begin().copy(encrypted.length(), enc_copy.c_str());
+  char* enc_data = enc_copy.c_str();
+  const size_t enc_chunk_size = 4096 + 16;  // ciphertext + tag
+  char temp[4112];
+  memcpy(temp, enc_data, enc_chunk_size);                       // save chunk0
+  memcpy(enc_data, enc_data + enc_chunk_size, enc_chunk_size);  // chunk1 -> chunk0 position
+  memcpy(enc_data + enc_chunk_size, temp, enc_chunk_size);      // chunk0 -> chunk1 position
+
+  bufferlist swapped;
+  swapped.append(enc_copy);
+
+  // Decryption should fail because AAD (chunk_index) won't match
+  bufferlist decrypted;
+  ASSERT_FALSE(aes->decrypt(swapped, 0, swapped.length(), decrypted, 0, null_yield));
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_aad_roundtrip)
+{
+  // Verify basic encrypt/decrypt still works correctly with AAD
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t key[32];
+  for (size_t i = 0; i < sizeof(key); i++) key[i] = i * 11;
+
+  // Test multiple chunk scenarios
+  for (size_t size : {4096u, 8192u, 12288u, 10000u}) {
+    auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+    ASSERT_NE(aes.get(), nullptr);
+
+    buffer::ptr buf(size);
+    char* p = buf.c_str();
+    for (size_t i = 0; i < size; i++) p[i] = (i * 17) & 0xFF;
+
+    bufferlist input;
+    input.append(buf);
+
+    bufferlist encrypted;
+    ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, 0, null_yield));
+
+    bufferlist decrypted;
+    ASSERT_TRUE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, 0, null_yield));
+
+    ASSERT_EQ(decrypted.length(), size);
+    ASSERT_EQ(std::string_view(input.c_str(), size),
+              std::string_view(decrypted.c_str(), size));
+  }
+}
+
+TEST(TestRGWCrypto, verify_AES_256_GCM_aad_offset_mismatch)
+{
+  // Verify AAD detects wrong stream offset during decryption
+  NoDoutPrefix no_dpp(g_ceph_context, ceph_subsys_rgw);
+  uint8_t key[32];
+  for (size_t i = 0; i < sizeof(key); i++) key[i] = i * 13;
+
+  auto aes(AES_256_GCM_create(&no_dpp, g_ceph_context, &key[0], 32));
+  ASSERT_NE(aes.get(), nullptr);
+
+  const size_t size = 4096;
+  buffer::ptr buf(size);
+  char* p = buf.c_str();
+  for (size_t i = 0; i < size; i++) p[i] = i & 0xFF;
+
+  bufferlist input;
+  input.append(buf);
+
+  // Encrypt at offset 8192 (chunk index 2)
+  off_t stream_offset = 8192;
+  bufferlist encrypted;
+  ASSERT_TRUE(aes->encrypt(input, 0, size, encrypted, stream_offset, null_yield));
+
+  // Decrypt with same offset - should succeed
+  bufferlist decrypted;
+  ASSERT_TRUE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted, stream_offset, null_yield));
+  ASSERT_EQ(std::string_view(input.c_str(), size),
+            std::string_view(decrypted.c_str(), size));
+
+  // Decrypt with wrong offset (0 instead of 8192) - should FAIL (AAD mismatch)
+  bufferlist decrypted_wrong;
+  ASSERT_FALSE(aes->decrypt(encrypted, 0, encrypted.length(), decrypted_wrong, 0, null_yield));
 }
 
 

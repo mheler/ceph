@@ -2515,11 +2515,15 @@ void RGWGetObj::execute(optional_yield y)
   /* start gettorrent */
   if (get_torrent) {
     attr_iter = attrs.find(RGW_ATTR_CRYPT_MODE);
-    if (attr_iter != attrs.end() && attr_iter->second.to_str() == "SSE-C-AES256") {
-      ldpp_dout(this, 0) << "ERROR: torrents are not supported for objects "
-          "encrypted with SSE-C" << dendl;
-      op_ret = -EINVAL;
-      goto done_err;
+    if (attr_iter != attrs.end()) {
+      std::string crypt_mode = attr_iter->second.to_str();
+      // Block torrents for any SSE-C mode (SSE-C-AES256, SSE-C-AES256-GCM, etc.)
+      if (crypt_mode.compare(0, 5, "SSE-C") == 0) {
+        ldpp_dout(this, 0) << "ERROR: torrents are not supported for objects "
+            "encrypted with SSE-C" << dendl;
+        op_ret = -EINVAL;
+        goto done_err;
+      }
     }
     // read torrent info from attr
     bufferlist torrentbl;
@@ -2630,6 +2634,37 @@ void RGWGetObj::execute(optional_yield y)
     return;
   }
 
+  // Preserve encrypted size before any plaintext conversion (for decrypt filter range clamping)
+  encrypted_obj_size = s->obj_size;
+
+  // For GCM encryption: use stored plaintext size for correct Content-Length
+  if (encrypted && !need_decompress && !skip_decrypt) {
+    auto plaintext_attr = attrs.find(RGW_ATTR_CRYPT_PLAINTEXT_SIZE);
+    if (plaintext_attr != attrs.end()) {
+      try {
+        s->obj_size = std::stoull(plaintext_attr->second.to_str());
+        s->object->set_obj_size(s->obj_size);
+      } catch (const std::exception& e) {
+        ldpp_dout(this, 0) << "ERROR: invalid RGW_ATTR_CRYPT_PLAINTEXT_SIZE: "
+                           << e.what() << dendl;
+        // Fall back to encrypted size (s->obj_size unchanged)
+      }
+    } else {
+      // Fallback for GCM when attr is missing (zero-byte or chunked uploads)
+      auto mode_attr = attrs.find(RGW_ATTR_CRYPT_MODE);
+      if (mode_attr != attrs.end()) {
+        std::string mode = mode_attr->second.to_str();
+        if (is_gcm_mode(mode)) {
+          uint64_t enc_size = s->obj_size;
+          s->obj_size = gcm_encrypted_to_plaintext_size(enc_size);
+          s->object->set_obj_size(s->obj_size);
+          ldpp_dout(this, 20) << "GCM: calculated plaintext size " << s->obj_size
+                              << " from encrypted " << enc_size << dendl;
+        }
+      }
+    }
+  }
+
   // for range requests with obj size 0
   if (range_str && !(s->obj_size)) {
     total_len = 0;
@@ -2664,6 +2699,8 @@ void RGWGetObj::execute(optional_yield y)
   if (decrypt != nullptr) {
     filter = decrypt.get();
     filter->fixup_range(ofs_x, end_x);
+    // Note: obj_size conversion for GCM is done BEFORE range_to_ofs() to ensure
+    // Range headers are interpreted correctly. See the conversion above.
   }
   if (op_ret < 0) {
     goto done_err;
@@ -9964,7 +10001,8 @@ int get_decrypt_filter(
   std::map<std::string, bufferlist>& attrs,
   bufferlist* manifest_bl,
   std::map<std::string, std::string>* crypt_http_responses,
-  bool copy_source)
+  bool copy_source,
+  off_t encrypted_total_size)
 {
   std::unique_ptr<BlockCrypt> block_crypt;
   int res = rgw_s3_prepare_decrypt(s, s->yield, attrs, &block_crypt,
@@ -10001,6 +10039,6 @@ int get_decrypt_filter(
 
   *filter = std::make_unique<RGWGetObj_BlockDecrypt>(
       s, s->cct, cb, std::move(block_crypt),
-      std::move(parts_len), s->yield);
+      std::move(parts_len), encrypted_total_size, s->yield);
   return 0;
 }

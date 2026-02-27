@@ -99,6 +99,9 @@ class QccCrypto {
     struct QCCSESS {
       Cpa32U sess_ctx_sz;
       CpaCySymSessionCtx sess_ctx;
+      Cpa8U cached_key[AES_256_KEY_SIZE];
+      CpaCySymCipherDirection cached_direction;
+      bool has_session;
     } *qcc_sess;
 
     /*
@@ -111,17 +114,24 @@ class QccCrypto {
       bool is_mem_alloc;
       bool op_complete;
       CpaCySymDpOpData *sym_op_data[MAX_NUM_SYM_REQ_BATCH];
+      CpaPhysicalAddr sym_op_data_phys[MAX_NUM_SYM_REQ_BATCH];
       Cpa8U *src_buff[MAX_NUM_SYM_REQ_BATCH];
+      CpaPhysicalAddr src_buff_phys[MAX_NUM_SYM_REQ_BATCH];
       Cpa8U *iv_buff[MAX_NUM_SYM_REQ_BATCH];
+      CpaPhysicalAddr iv_buff_phys[MAX_NUM_SYM_REQ_BATCH];
     } *qcc_op_mem;
 
     /*
      * Handle queue with free instances to handle op
      */
     boost::circular_buffer<int> open_instances;
+    std::mutex instance_mutex;
     void QccFreeInstance(int entry);
+    int sync_get_instance();
+    void sync_free_instance(int entry);
     std::thread qat_poll_thread;
     bool thread_stop{false};
+    std::unique_ptr<std::atomic<bool>[]> instance_inline_polling;
 
     /*
      * Contiguous Memory Allocator and de-allocator. We are using the usdm
@@ -200,6 +210,10 @@ class QccCrypto {
                             CpaCySymCipherDirection cipherDirection);
 
 
+};
+
+struct SyncCompletionTag {
+    std::atomic<size_t> remaining{0};
 };
 
 class QatCrypto {

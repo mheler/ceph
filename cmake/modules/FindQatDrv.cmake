@@ -47,6 +47,7 @@ if(QATDRV_INCLUDE_DIR)
   set(QatDrv_INCLUDE_DIRS
       ${QATDRV_INCLUDE_DIR}/quickassist/include
       ${QATDRV_INCLUDE_DIR}/quickassist/include/dc
+      ${QATDRV_INCLUDE_DIR}/quickassist/include/icp
       ${QATDRV_INCLUDE_DIR}/quickassist/lookaside/access_layer/include
       ${QATDRV_INCLUDE_DIR}/quickassist/include/lac
       ${QATDRV_INCLUDE_DIR}/quickassist/utilities/libusdm_drv

@@ -24,7 +24,7 @@ class QccCryptoAccel : public CryptoAccel {
   public:
     QccCrypto qcccrypto;
     QccCryptoAccel(const size_t chunk_size, const size_t max_requests):qcccrypto() { qcccrypto.init(chunk_size, max_requests); };
-    ~QccCryptoAccel() { qcccrypto.destroy(); };
+    ~QccCryptoAccel() = default;
 
     bool cbc_encrypt(unsigned char* out, const unsigned char* in, size_t size,
         const unsigned char (&iv)[AES_256_IVSIZE],

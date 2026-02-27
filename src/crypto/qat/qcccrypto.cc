@@ -12,6 +12,8 @@
 #include <future>
 #include <chrono>
 
+#include <immintrin.h>
+
 #include <boost/asio/append.hpp>
 #include <boost/asio/async_result.hpp>
 #include "boost/container/static_vector.hpp"
@@ -37,7 +39,15 @@ static void symDpCallback(CpaCySymDpOpData *pOpData,
 {
   if (nullptr != pOpData->pCallbackTag)
   {
-    static_cast<QatCrypto*>(pOpData->pCallbackTag)->complete();
+    auto tag = reinterpret_cast<uintptr_t>(pOpData->pCallbackTag);
+    if (tag & 1) {
+      // Sync inline-poll path: tagged SyncCompletionTag*
+      auto* sync_tag = reinterpret_cast<SyncCompletionTag*>(tag & ~uintptr_t(1));
+      sync_tag->remaining.fetch_sub(1, std::memory_order_release);
+    } else {
+      // Async path: QatCrypto*
+      static_cast<QatCrypto*>(pOpData->pCallbackTag)->complete();
+    }
   }
 }
 
@@ -55,6 +65,7 @@ auto QccCrypto::async_get_instance(CompletionToken&& token) {
   return boost::asio::async_initiate<CompletionToken, Signature>(
       [this] (auto handler) {
         boost::asio::post(my_pool, [this, handler = std::move(handler)]()mutable{
+          std::lock_guard<std::mutex> lock(instance_mutex);
           if (!open_instances.empty()) {
             int avail_inst = open_instances.front();
             open_instances.pop_front();
@@ -73,6 +84,7 @@ auto QccCrypto::async_get_instance(CompletionToken&& token) {
 
 void QccCrypto::QccFreeInstance(int entry) {
   boost::asio::post(my_pool, [this, entry]()mutable{
+    std::lock_guard<std::mutex> lock(instance_mutex);
     if (!instance_completions.empty()) {
       boost::asio::dispatch(boost::asio::append(
           std::move(instance_completions.front()), entry));
@@ -81,6 +93,21 @@ void QccCrypto::QccFreeInstance(int entry) {
       open_instances.push_back(entry);
     }
   });
+}
+
+int QccCrypto::sync_get_instance() {
+  std::lock_guard<std::mutex> lock(instance_mutex);
+  if (open_instances.empty()) {
+    return NON_INSTANCE;
+  }
+  int inst = open_instances.front();
+  open_instances.pop_front();
+  return inst;
+}
+
+void QccCrypto::sync_free_instance(int entry) {
+  std::lock_guard<std::mutex> lock(instance_mutex);
+  open_instances.push_back(entry);
 }
 
 void QccCrypto::cleanup() {
@@ -100,6 +127,10 @@ void QccCrypto::poll_instances(void) {
     int free_instance_num = 0;
     for (int iter = 0; iter < qcc_inst->num_instances; iter++) {
       if (qcc_inst->is_polled[iter] == CPA_TRUE) {
+        if (instance_inline_polling &&
+            instance_inline_polling[iter].load(std::memory_order_acquire)) {
+          continue;
+        }
         stat = icp_sal_CyPollDpInstance(qcc_inst->cy_inst_handles[iter], 0);
         if (stat != CPA_STATUS_SUCCESS) {
           free_instance_num++;
@@ -192,6 +223,10 @@ bool QccCrypto::init(const size_t chunk_size, const size_t max_requests) {
     instance_completions.set_capacity(max_requests - qcc_inst->num_instances);
   }
   open_instances.set_capacity(qcc_inst->num_instances);
+  instance_inline_polling = std::make_unique<std::atomic<bool>[]>(qcc_inst->num_instances);
+  for (int i = 0; i < qcc_inst->num_instances; i++) {
+    instance_inline_polling[i].store(false, std::memory_order_relaxed);
+  }
 
   int iter = 0;
   //Start Instances
@@ -220,14 +255,16 @@ bool QccCrypto::init(const size_t chunk_size, const size_t max_requests) {
     this->cleanup();
     return false;
   }
+  memset(qcc_sess, 0, qcc_inst->num_instances * sizeof(QCCSESS));
 
   qcc_os_mem_alloc((void **)&qcc_op_mem,
       ((int)qcc_inst->num_instances * sizeof(QCCOPMEM)));
-  if (qcc_sess == NULL) {
+  if (qcc_op_mem == NULL) {
     derr << "Unable to allocate memory for opmem struct" << dendl;
     this->cleanup();
     return false;
   }
+  memset(qcc_op_mem, 0, qcc_inst->num_instances * sizeof(QCCOPMEM));
 
   //At this point we are only doing an user-space version.
   for (iter = 0; iter < qcc_inst->num_instances; iter++) {
@@ -261,7 +298,6 @@ bool QccCrypto::init(const size_t chunk_size, const size_t max_requests) {
 
 bool QccCrypto::destroy() {
   if((!is_init) || (!init_called)) {
-    dout(15) << "QAT not initialized here. Nothing to do" << dendl;
     return false;
   }
 
@@ -271,22 +307,30 @@ bool QccCrypto::destroy() {
   }
   my_pool.join();
 
-  dout(10) << "Destroying QAT crypto & related memory" << dendl;
   int iter = 0;
 
-  // Free up op related memory
-  for (iter =0; iter < qcc_inst->num_instances; iter++) {
-    for (size_t i = 0; i < MAX_NUM_SYM_REQ_BATCH; i++) {
-      qcc_contig_mem_free((void **)&(qcc_op_mem[iter].src_buff[i]));
-      qcc_contig_mem_free((void **)&(qcc_op_mem[iter].iv_buff[i]));
-      qcc_contig_mem_free((void **)&(qcc_op_mem[iter].sym_op_data[i]));
+  if (qcc_op_mem) {
+    // Free up op related memory — only for instances that allocated buffers
+    for (iter = 0; iter < qcc_inst->num_instances; iter++) {
+      if (!qcc_op_mem[iter].is_mem_alloc) continue;
+      for (size_t i = 0; i < MAX_NUM_SYM_REQ_BATCH; i++) {
+        qcc_contig_mem_free((void **)&(qcc_op_mem[iter].src_buff[i]));
+        qcc_contig_mem_free((void **)&(qcc_op_mem[iter].iv_buff[i]));
+        qcc_contig_mem_free((void **)&(qcc_op_mem[iter].sym_op_data[i]));
+      }
     }
   }
 
-  // Free up Session memory
-  for (iter = 0; iter < qcc_inst->num_instances; iter++) {
-    cpaCySymDpRemoveSession(qcc_inst->cy_inst_handles[iter], qcc_sess[iter].sess_ctx);
-    qcc_contig_mem_free((void **)&(qcc_sess[iter].sess_ctx));
+  if (qcc_sess) {
+    // Free up Session memory
+    for (iter = 0; iter < qcc_inst->num_instances; iter++) {
+      if (qcc_sess[iter].has_session) {
+        cpaCySymDpRemoveSession(qcc_inst->cy_inst_handles[iter], qcc_sess[iter].sess_ctx);
+      }
+      if (qcc_sess[iter].sess_ctx) {
+        qcc_contig_mem_free((void **)&(qcc_sess[iter].sess_ctx));
+      }
+    }
   }
 
   // Stop QAT Instances
@@ -337,8 +381,7 @@ bool QccCrypto::perform_op_batch(unsigned char* out, const unsigned char* in, si
     boost::asio::yield_context yield = y.get_yield_context();
     avail_inst = async_get_instance(yield);
   } else {
-    auto result = async_get_instance(boost::asio::use_future);
-    avail_inst = result.get();
+    avail_inst = sync_get_instance();
   }
 
   if (avail_inst == NON_INSTANCE) {
@@ -347,11 +390,16 @@ bool QccCrypto::perform_op_batch(unsigned char* out, const unsigned char* in, si
 
   dout(15) << "Using dp_batch inst " << avail_inst << dendl;
 
-  auto sg = make_scope_guard([this, avail_inst] {
+  bool is_sync = !y;
+  auto sg = make_scope_guard([this, avail_inst, is_sync] {
       //free up the instance irrespective of the op status
       dout(15) << "Completed task under " << avail_inst << dendl;
       qcc_op_mem[avail_inst].op_complete = false;
-      QccCrypto::QccFreeInstance(avail_inst);
+      if (is_sync) {
+        sync_free_instance(avail_inst);
+      } else {
+        QccCrypto::QccFreeInstance(avail_inst);
+      }
       });
 
   /*
@@ -383,24 +431,43 @@ bool QccCrypto::perform_op_batch(unsigned char* out, const unsigned char* in, si
       }
     }
 
-    // Set memalloc flag so that we don't go through this exercise again.
+    // Cache physical addresses — DMA buffers never move
+    for (size_t i = 0; i < MAX_NUM_SYM_REQ_BATCH; i++) {
+      qcc_op_mem[avail_inst].sym_op_data_phys[i] = qaeVirtToPhysNUMA(qcc_op_mem[avail_inst].sym_op_data[i]);
+      qcc_op_mem[avail_inst].src_buff_phys[i] = qaeVirtToPhysNUMA(qcc_op_mem[avail_inst].src_buff[i]);
+      qcc_op_mem[avail_inst].iv_buff_phys[i] = qaeVirtToPhysNUMA(qcc_op_mem[avail_inst].iv_buff[i]);
+    }
+
     qcc_op_mem[avail_inst].is_mem_alloc = true;
     qcc_sess[avail_inst].sess_ctx = nullptr;
-    status = initSession(qcc_inst->cy_inst_handles[avail_inst],
-                             &(qcc_sess[avail_inst].sess_ctx),
-                             (Cpa8U *)key,
-                             op_type);
+    qcc_sess[avail_inst].has_session = false;
+  }
+
+  // Reuse session if key and direction are unchanged
+  if (qcc_sess[avail_inst].has_session &&
+      qcc_sess[avail_inst].cached_direction == op_type &&
+      memcmp(qcc_sess[avail_inst].cached_key, key, AES_256_KEY_SIZE) == 0) {
+    status = CPA_STATUS_SUCCESS;
   } else {
     do {
-      cpaCySymDpRemoveSession(qcc_inst->cy_inst_handles[avail_inst], qcc_sess[avail_inst].sess_ctx);
+      if (qcc_sess[avail_inst].has_session) {
+        cpaCySymDpRemoveSession(qcc_inst->cy_inst_handles[avail_inst], qcc_sess[avail_inst].sess_ctx);
+        qcc_sess[avail_inst].has_session = false;
+      }
       status = initSession(qcc_inst->cy_inst_handles[avail_inst],
                            &(qcc_sess[avail_inst].sess_ctx),
                            (Cpa8U *)key,
                            op_type);
       if (unlikely(status == CPA_STATUS_RETRY)) {
-        dout(1) << "cpaCySymDpRemoveSession and initSession retry" << dendl;
+        qcc_sess[avail_inst].has_session = true;
+        dout(1) << "initSession retry" << dendl;
       }
     } while (status == CPA_STATUS_RETRY);
+    if (likely(status == CPA_STATUS_SUCCESS)) {
+      memcpy(qcc_sess[avail_inst].cached_key, key, AES_256_KEY_SIZE);
+      qcc_sess[avail_inst].cached_direction = op_type;
+      qcc_sess[avail_inst].has_session = true;
+    }
   }
   if (unlikely(status != CPA_STATUS_SUCCESS)) {
     derr << "Unable to init session with status =" << status << dendl;
@@ -516,6 +583,7 @@ bool QccCrypto::symPerformOp(int avail_inst,
   size_t perform_retry_num = 0;
   for (Cpa32U off = 0; off < size; off += one_batch_size) {
     QatCrypto helper{my_pool.get_executor()};
+    SyncCompletionTag sync_tag;
     boost::container::static_vector<CpaCySymDpOpData*, MAX_NUM_SYM_REQ_BATCH> pOpDataVec;
     for (Cpa32U offset = off, i = 0; offset < size && i < MAX_NUM_SYM_REQ_BATCH; offset += chunk_size, i++) {
       CpaCySymDpOpData *pOpData = qcc_op_mem[avail_inst].sym_op_data[i];
@@ -528,19 +596,24 @@ bool QccCrypto::symPerformOp(int avail_inst,
       memcpy(pIvBuffer, &pIv[iv_index * ivLen], ivLen);
       iv_index++;
 
-      //pOpData assignment
-      pOpData->thisPhys = qaeVirtToPhysNUMA(pOpData);
+      //pOpData assignment — use cached physical addresses
+      pOpData->thisPhys = qcc_op_mem[avail_inst].sym_op_data_phys[i];
       pOpData->instanceHandle = qcc_inst->cy_inst_handles[avail_inst];
       pOpData->sessionCtx = sessionCtx;
-      pOpData->pCallbackTag = &helper;
+      if (y) {
+        pOpData->pCallbackTag = &helper;
+      } else {
+        pOpData->pCallbackTag = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(&sync_tag) | 1);
+      }
       pOpData->cryptoStartSrcOffsetInBytes = 0;
       pOpData->messageLenToCipherInBytes = process_size;
-      pOpData->iv = qaeVirtToPhysNUMA(pIvBuffer);
+      pOpData->iv = qcc_op_mem[avail_inst].iv_buff_phys[i];
       pOpData->pIv = pIvBuffer;
       pOpData->ivLenInBytes = ivLen;
-      pOpData->srcBuffer = qaeVirtToPhysNUMA(pSrcBuffer);
+      pOpData->srcBuffer = qcc_op_mem[avail_inst].src_buff_phys[i];
       pOpData->srcBufferLen = process_size;
-      pOpData->dstBuffer = qaeVirtToPhysNUMA(pSrcBuffer);
+      pOpData->dstBuffer = qcc_op_mem[avail_inst].src_buff_phys[i];
       pOpData->dstBufferLen = process_size;
 
       pOpDataVec.push_back(pOpData);
@@ -552,8 +625,20 @@ bool QccCrypto::symPerformOp(int avail_inst,
         boost::asio::yield_context yield = y.get_yield_context();
         status = helper.async_perform_op(std::span<CpaCySymDpOpData*>(pOpDataVec), yield);
       } else {
-        auto result = helper.async_perform_op(std::span<CpaCySymDpOpData*>(pOpDataVec), boost::asio::use_future);
-        status = result.get();
+        // Inline polling: bypass async machinery entirely
+        sync_tag.remaining.store(pOpDataVec.size(), std::memory_order_release);
+        instance_inline_polling[avail_inst].store(true, std::memory_order_release);
+        status = cpaCySymDpEnqueueOpBatch(pOpDataVec.size(), pOpDataVec.data(), CPA_TRUE);
+        if (status == CPA_STATUS_SUCCESS) {
+          while (sync_tag.remaining.load(std::memory_order_acquire) > 0) {
+            CpaStatus poll_status = icp_sal_CyPollDpInstance(
+                qcc_inst->cy_inst_handles[avail_inst], 0);
+            if (poll_status == CPA_STATUS_RETRY) {
+              _mm_pause();
+            }
+          }
+        }
+        instance_inline_polling[avail_inst].store(false, std::memory_order_release);
       }
       if (status == CPA_STATUS_RETRY) {
         if (++perform_retry_num > 3) {

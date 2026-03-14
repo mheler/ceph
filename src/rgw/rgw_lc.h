@@ -20,6 +20,7 @@
 #include "cls/rgw/cls_rgw_types.h"
 #include "rgw_tag.h"
 #include "rgw_sal.h"
+#include "rgw_lc_delete_throttle.h"
 
 #include <atomic>
 #include <tuple>
@@ -573,6 +574,7 @@ class RGWLC : public DoutPrefixProvider {
   std::string *obj_names{nullptr};
   std::atomic<bool> down_flag = { false };
   std::string cookie;
+  std::unique_ptr<LCDeleteThrottle> delete_throttle;
 
 public:
 

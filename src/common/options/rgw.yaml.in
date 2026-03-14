@@ -455,9 +455,42 @@ options:
   fmt_desc: This option specifies the number of coroutines in each lifecycle
     workers work pool. This option can help accelerate processing each bucket.
   default: 128
+  min: 1
   services:
   - rgw
   with_legacy: true
+- name: rgw_lc_delete_adaptive_throttle
+  type: bool
+  level: advanced
+  desc: Enable adaptive sleep between LC delete operations based on observed latency
+  long_desc: When enabled, the lifecycle processor tracks RADOS delete latencies
+    in a sliding window and injects sleeps when tail latency diverges from median,
+    reducing OSD pressure from background lifecycle deletes.
+  default: false
+  services:
+  - rgw
+- name: rgw_lc_delete_max_sleep_ms
+  type: uint
+  level: advanced
+  desc: Maximum sleep injected between LC delete operations (milliseconds)
+  long_desc: Upper bound on the adaptive sleep injected between lifecycle delete
+    operations. The actual sleep scales linearly between 0 and this value based on
+    observed latency ratios.
+  default: 100
+  services:
+  - rgw
+- name: rgw_lc_delete_latency_ceiling_us
+  type: uint
+  level: advanced
+  desc: When p50 LC delete latency exceeds this value, apply max sleep regardless
+    of ratio. 0 disables.
+  long_desc: Absolute latency ceiling in microseconds. When the median (p50) delete
+    latency exceeds this value, the maximum sleep is applied regardless of the
+    p95/p50 ratio. This catches uniform overload where the entire latency distribution
+    rises together. Set to 0 (default) to disable.
+  default: 0
+  services:
+  - rgw
 - name: rgw_lc_max_objs
   type: int
   level: advanced

@@ -45,6 +45,9 @@ void add_rgw_frontend_counters(PerfCountersBuilder *pcb) {
 		      "Lifecycle non-current transition");
   pcb->add_u64_counter(l_rgw_lc_abort_mpu, "lc_abort_mpu",
 		      "Lifecycle abort multipart upload");
+  pcb->add_u64(l_rgw_lc_delete_throttle_sleep_us,
+	       "lc_delete_throttle_sleep_us",
+	       "Lifecycle delete throttle sleep (microseconds)");
 
   pcb->add_u64_counter(l_rgw_pubsub_event_triggered, "pubsub_event_triggered", "Pubsub events with at least one topic");
   pcb->add_u64_counter(l_rgw_pubsub_event_lost, "pubsub_event_lost", "Pubsub events lost");

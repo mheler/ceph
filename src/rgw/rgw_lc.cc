@@ -9,9 +9,12 @@
 #include <tuple>
 #include <functional>
 
+#include <chrono>
+
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include "include/scope_guard.h"
 #include "include/function2.hpp"
@@ -248,6 +251,10 @@ void RGWLC::initialize(CephContext *_cct, rgw::sal::Driver* _driver) {
   char cookie_buf[COOKIE_LEN + 1];
   gen_rand_alphanumeric(cct, cookie_buf, sizeof(cookie_buf) - 1);
   cookie = cookie_buf;
+
+  auto max_wp = static_cast<uint32_t>(
+    cct->_conf.get_val<int64_t>("rgw_lc_max_wp_worker"));
+  delete_throttle = std::make_unique<LCDeleteThrottle>(max_wp);
 }
 
 void RGWLC::finalize()
@@ -484,11 +491,13 @@ struct op_env {
   LCWorker* worker;
   rgw::sal::Bucket* bucket;
   LCObjsLister& ol;
+  LCDeleteThrottle& throttle;
 
   op_env(lc_op& _op, rgw::sal::Driver* _driver, LCWorker* _worker,
-	 rgw::sal::Bucket* _bucket, LCObjsLister& _ol)
+	 rgw::sal::Bucket* _bucket, LCObjsLister& _ol,
+	 LCDeleteThrottle& _throttle)
     : op(_op), driver(_driver), worker(_worker), bucket(_bucket),
-      ol(_ol) {}
+      ol(_ol), throttle(_throttle) {}
 }; /* op_env */
 
 class LCRuleOp;
@@ -511,6 +520,7 @@ struct lc_op_ctx {
 
   std::unique_ptr<rgw::sal::PlacementTier> tier;
   const RGWObjTags* cached_tags{nullptr};
+  LCDeleteThrottle& throttle;
 
   lc_op_ctx(op_env& env, rgw_bucket_dir_entry& o,
 	    boost::optional<std::string> next_key_name,
@@ -520,7 +530,7 @@ struct lc_op_ctx {
     : cct(env.driver->ctx()), env(env), o(o), next_key_name(next_key_name),
       num_noncurrent(num_noncurrent), effective_mtime(effective_mtime),
       driver(env.driver), bucket(env.bucket), op(env.op), ol(env.ol),
-      dpp(dpp)
+      dpp(dpp), throttle(env.throttle)
     {
       obj = bucket->get_object(o.key);
       /* once bucket versioning is enabled, the non-current entries with
@@ -630,7 +640,8 @@ static bool zonegroup_lc_check(const DoutPrefixProvider *dpp, rgw::sal::Zone* zo
 static int remove_expired_obj(const DoutPrefixProvider* dpp,
                               optional_yield y, lc_op_ctx& oc,
                               bool remove_indeed,
-                              const rgw::notify::EventTypeList& event_types) {
+                              const rgw::notify::EventTypeList& event_types,
+                              uint64_t* op_latency_us = nullptr) {
   int ret{0};
   auto& driver = oc.driver;
   auto& bucket_info = oc.bucket->get_info();
@@ -685,7 +696,13 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
 
   uint32_t flags = (!remove_indeed || !zonegroup_lc_check(dpp, oc.driver->get_zone()))
                    ? rgw::sal::FLAG_LOG_OP : 0;
+  auto delete_start = ceph::mono_clock::now();
   ret =  del_op->delete_obj(dpp, y, flags);
+  if (op_latency_us) {
+    *op_latency_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        ceph::mono_clock::now() - delete_start).count();
+  }
   if (ret < 0) {
     ldpp_dout(dpp, 1) <<
       fmt::format("ERROR: {} failed, with error: {}", __func__, ret) << dendl;
@@ -699,6 +716,27 @@ static int remove_expired_obj(const DoutPrefixProvider* dpp,
   return ret;
 
 } /* remove_expired_obj */
+
+static void lc_delete_throttle_sleep(lc_op_ctx& oc, optional_yield y,
+                                     uint64_t op_latency_us)
+{
+  auto cct = oc.cct;
+  if (!cct->_conf.get_val<bool>("rgw_lc_delete_adaptive_throttle") ||
+      op_latency_us == 0) {
+    return;
+  }
+  oc.throttle.record(op_latency_us,
+                     cct->_conf.get_val<uint64_t>("rgw_lc_delete_max_sleep_ms"),
+                     cct->_conf.get_val<uint64_t>("rgw_lc_delete_latency_ceiling_us"));
+  auto sleep = oc.throttle.get_sleep();
+  if (sleep > 0) {
+    auto& yield = y.get_yield_context();
+    boost::asio::steady_timer timer(yield.get_executor());
+    timer.expires_after(std::chrono::microseconds(sleep));
+    boost::system::error_code ec;
+    timer.async_wait(yield[ec]);
+  }
+}
 
 class LCOpAction {
 public:
@@ -1085,11 +1123,13 @@ public:
   int process(lc_op_ctx& oc, optional_yield y) override {
     auto& o = oc.o;
     int r;
+    uint64_t op_latency_us = 0;
     if (o.is_delete_marker()) {
       r = remove_expired_obj(
           oc.dpp, y, oc, true,
           {rgw::notify::ObjectExpirationDeleteMarker,
-           rgw::notify::LifecycleExpirationDeleteMarkerCreated});
+           rgw::notify::LifecycleExpirationDeleteMarkerCreated},
+          &op_latency_us);
       if (r < 0) {
 	ldpp_dout(oc.dpp, 0) << "ERROR: current is-dm remove_expired_obj "
 			 << oc.bucket << ":" << o.key
@@ -1098,11 +1138,13 @@ public:
       }
       ldpp_dout(oc.dpp, 2) << "DELETED: current is-dm "
 		       << oc.bucket << ":" << o.key << dendl;
+      lc_delete_throttle_sleep(oc, y, op_latency_us);
     } else {
       /* ! o.is_delete_marker() */
       r = remove_expired_obj(oc.dpp, y, oc, !oc.bucket->versioning_enabled(),
                              {rgw::notify::ObjectExpirationCurrent,
-                              rgw::notify::LifecycleExpirationDelete});
+                              rgw::notify::LifecycleExpirationDelete},
+                             &op_latency_us);
       if (r < 0) {
 	ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj "
 			 << oc.bucket << ":" << o.key
@@ -1114,6 +1156,7 @@ public:
       }
       ldpp_dout(oc.dpp, 2) << "DELETED:" << oc.bucket << ":" << o.key
 		       << dendl;
+      lc_delete_throttle_sleep(oc, y, op_latency_us);
     }
     return 0;
   }
@@ -1152,11 +1195,13 @@ public:
 
   int process(lc_op_ctx& oc, optional_yield y) override {
     auto& o = oc.o;
+    uint64_t op_latency_us = 0;
     int r = remove_expired_obj(oc.dpp, y, oc, true,
                                {rgw::notify::LifecycleExpirationDelete,
-				rgw::notify::ObjectExpirationNoncurrent});
+				rgw::notify::ObjectExpirationNoncurrent},
+                               &op_latency_us);
     if (r < 0) {
-      ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj (non-current expiration) " 
+      ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj (non-current expiration) "
 			   << oc.bucket << ":" << o.key
 			   << " " << cpp_strerror(r) << dendl;
       return r;
@@ -1166,6 +1211,7 @@ public:
     }
     ldpp_dout(oc.dpp, 2) << "DELETED:" << oc.bucket << ":" << o.key
 		     << " (non-current expiration)" << dendl;
+    lc_delete_throttle_sleep(oc, y, op_latency_us);
     return 0;
   }
 };
@@ -1196,9 +1242,11 @@ public:
 
   int process(lc_op_ctx& oc, optional_yield y) override {
     auto& o = oc.o;
+    uint64_t op_latency_us = 0;
     int r = remove_expired_obj(oc.dpp, y, oc, true,
         {rgw::notify::ObjectExpirationDeleteMarker,
-         rgw::notify::LifecycleExpirationDeleteMarkerCreated});
+         rgw::notify::LifecycleExpirationDeleteMarkerCreated},
+        &op_latency_us);
     if (r < 0) {
       ldpp_dout(oc.dpp, 0) << "ERROR: remove_expired_obj (delete marker expiration) "
 		       << oc.bucket << ":" << o.key
@@ -1211,6 +1259,7 @@ public:
     }
     ldpp_dout(oc.dpp, 2) << "DELETED:" << oc.bucket << ":" << o.key
 		     << " (delete marker expiration)" << dendl;
+    lc_delete_throttle_sleep(oc, y, op_latency_us);
     return 0;
   }
 };
@@ -1272,25 +1321,29 @@ public:
 
   int delete_tier_obj(lc_op_ctx& oc, optional_yield y) {
     int ret = 0;
+    uint64_t op_latency_us = 0;
 
     /* If bucket has versioning enabled, create delete_marker for current version
      */
     if (! oc.bucket->versioning_enabled()) {
       ret =
-	remove_expired_obj(oc.dpp, y, oc, true, {/* no delete notify expected */});
+	remove_expired_obj(oc.dpp, y, oc, true, {/* no delete notify expected */},
+                           &op_latency_us);
       ldpp_dout(oc.dpp, 20) << "delete_tier_obj Object(key:" << oc.o.key
                             << ") not versioned flags: " << oc.o.flags << dendl;
     } else {
       /* versioned */
       if (oc.o.is_current() && !oc.o.is_delete_marker()) {
-        ret = remove_expired_obj(oc.dpp, y, oc, false, {/* no delete notify expected */});
+        ret = remove_expired_obj(oc.dpp, y, oc, false, {/* no delete notify expected */},
+                                 &op_latency_us);
         ldpp_dout(oc.dpp, 20) << "delete_tier_obj Object(key:" << oc.o.key
                               << ") current & not delete_marker"
                               << " versioned_epoch:  " << oc.o.versioned_epoch
                               << "flags: " << oc.o.flags << dendl;
       } else {
         ret = remove_expired_obj(oc.dpp, y, oc, true,
-				 {/* no delete notify expected */});
+				 {/* no delete notify expected */},
+                                 &op_latency_us);
         ldpp_dout(oc.dpp, 20)
             << "delete_tier_obj Object(key:" << oc.o.key << ") not current "
             << "versioned_epoch:  " << oc.o.versioned_epoch
@@ -1298,6 +1351,7 @@ public:
       }
     }
 
+    lc_delete_throttle_sleep(oc, y, op_latency_us);
     return ret;
   }
 
@@ -1757,7 +1811,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     std::vector<LCOpRule> rules;
     rules.reserve(active_ops.size());
     for (auto* op : active_ops) {
-      op_env oenv(*op, driver, worker, bucket.get(), ol);
+      op_env oenv(*op, driver, worker, bucket.get(), ol, *delete_throttle);
       rules.emplace_back(oenv);
       rules.back().build(); // why can't ctor do it?
     }

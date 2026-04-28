@@ -48,7 +48,15 @@ case "${CEPH_BASE_BRANCH}~${DISTRO_KIND}" in
         apt-get install -y --no-install-recommends \
             wget reprepro curl software-properties-common \
             lksctp-tools libsctp-dev protobuf-compiler ragel libc-ares-dev \
-            awscli s3cmd iproute2
+            iproute2 s3cmd unzip
+        # awscli is no longer packaged on recent Ubuntu releases; use the
+        # official AWS CLI v2 installer from amazon.
+        awscli_arch="$(uname -m)"
+        curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" \
+            -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install
+        rm -rf /tmp/awscliv2.zip /tmp/aws
         install_container_deps
     ;;
     *)

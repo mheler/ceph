@@ -31,19 +31,24 @@ fi
 # packages etc.
 case "${CEPH_BASE_BRANCH}~${DISTRO_KIND}" in
     *~*centos*8)
-        dnf install -y java-1.8.0-openjdk-headless /usr/bin/{rpmbuild,wget,curl}
+        dnf install -y java-1.8.0-openjdk-headless /usr/bin/{rpmbuild,wget,curl} \
+            awscli s3cmd iproute
         install_container_deps
         dnf_clean
     ;;
     # EL-ish, 9+
     *~*centos*|*~fedora*|*~rocky*|*~alma*)
-        dnf install -y /usr/bin/{rpmbuild,wget,curl}
+        dnf install -y /usr/bin/{rpmbuild,wget,curl} awscli s3cmd iproute
         install_container_deps
         dnf_clean
     ;;
     *~*ubuntu*|*~*debian*)
+        export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y wget reprepro curl software-properties-common lksctp-tools libsctp-dev protobuf-compiler ragel libc-ares-dev
+        apt-get install -y --no-install-recommends \
+            wget reprepro curl software-properties-common \
+            lksctp-tools libsctp-dev protobuf-compiler ragel libc-ares-dev \
+            awscli s3cmd iproute2
         install_container_deps
     ;;
     *)

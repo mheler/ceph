@@ -461,11 +461,11 @@ options:
 - name: rgw_lc_max_wp_worker
   type: int
   level: advanced
-  desc: Number of workpool coroutines per LCWorker
-  long_desc: Number of coroutines in per-LCWorker workpools--used to accelerate per-bucket
+  desc: Number of workpool coroutines per lifecycle stream
+  long_desc: Number of action coroutines in per-stream workpools--used to accelerate per-bucket
     processing
   fmt_desc: This option specifies the number of coroutines in each lifecycle
-    workers work pool. This option can help accelerate processing each bucket.
+    stream's action workpool. This option can help accelerate processing each bucket.
   default: 128
   services:
   - rgw
@@ -505,12 +505,39 @@ options:
 - name: rgw_lc_ordered_list_threshold
   type: uint
   level: dev
-  desc: Threshold for enabling ordered listing in lifecycle processing.
-  long_desc: When bucket shard count is below this threshold, lifecycle processing will
-    use ordered listing for better performance. Above this threshold, unordered listing
-    is used to avoid excessive OSD requests. A value of 0 disables ordered listing entirely.
+  desc: DEPRECATED — no longer consulted by lifecycle processing.
+  long_desc: DEPRECATED. As of the cooperative-LC release, lifecycle processing
+    always uses per-shard unordered listing; this threshold is not consulted by
+    any code path. Retained as a no-op so operator runbooks and orchestration
+    tooling that set it continue to load without errors. Will be removed in a
+    future release.
   default: 500
   min: 0
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_max_helpers_per_bucket
+  type: uint
+  level: advanced
+  desc: Maximum idle LCWorkers that may help process a single bucket
+  long_desc: Idle LCWorkers on the same RGW may join an active bucket as helpers, each
+    running its own listing+action stream. Effective count is min(this, rgw_lc_max_worker - 1).
+    Set to 0 to disable.
+  default: 2
+  min: 0
+  services:
+  - rgw
+  with_legacy: true
+- name: rgw_lc_listers_per_stream
+  type: uint
+  level: advanced
+  desc: Concurrent listing coroutines per engaged lifecycle stream.
+  long_desc: Each engaged stream (coordinator or helper) runs up to this many
+    listing coroutines, all pulling shards from the fan-out queue and feeding
+    the stream action workpool. Effective count is capped at the bucket shard
+    count.
+  default: 4
+  min: 1
   services:
   - rgw
   with_legacy: true

@@ -9,6 +9,7 @@
 #include <tuple>
 #include <functional>
 #include <atomic>
+#include <optional>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string.hpp>
@@ -53,15 +54,14 @@ constexpr int32_t secs_in_a_day = hours_in_a_day * 60 * 60;
 using namespace std;
 
 /*
- * Batching accumulator for LC counter updates.
- *
- * obj_scanned is touched only by the producer thread (the listing loop),
- * so it is non-atomic. All other staged counters are touched from worker
- * coroutines via record_*() and must be atomic.
+ * Batching accumulator for LC counter updates. All counters are atomic
+ * because the coordinator and any helpers concurrently increment them.
+ * flush_*() uses exchange(0) so increments between load-and-zero are
+ * not lost.
  */
 struct LCBatchCounters {
   PerfCounters* perf_counters;
-  uint64_t obj_scanned{0};
+  std::atomic<uint64_t> obj_scanned{0};
   std::atomic<uint64_t> obj_completed{0};
   std::atomic<uint64_t> obj_expired{0};
   std::atomic<uint64_t> obj_noncur_expired{0};
@@ -69,13 +69,15 @@ struct LCBatchCounters {
   std::atomic<uint64_t> obj_transitioned{0};
   std::atomic<uint64_t> obj_mpu_aborted{0};
   uint64_t flush_threshold;
+  // Serializes flush_all() across coord/helper streams.
+  std::mutex flush_mutex;
 
   LCBatchCounters(PerfCounters* pc, uint64_t threshold)
     : perf_counters(pc), flush_threshold(threshold) {}
 
   void increment_scanned() {
     if (!perf_counters) return;
-    ++obj_scanned;
+    obj_scanned.fetch_add(1, std::memory_order_relaxed);
   }
 
   void decrement_pending() {
@@ -108,23 +110,6 @@ struct LCBatchCounters {
     obj_mpu_aborted.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void flush_scanned() {
-    if (!perf_counters) return;
-    if (obj_scanned > 0) {
-      perf_counters->inc(l_rgw_lc_per_bucket_obj_scanned, obj_scanned);
-      perf_counters->inc(l_rgw_lc_per_bucket_obj_pending, obj_scanned);
-      obj_scanned = 0;
-    }
-  }
-
-  void flush_completed() {
-    if (!perf_counters) return;
-    uint64_t completed = obj_completed.exchange(0, std::memory_order_relaxed);
-    if (completed > 0) {
-      perf_counters->dec(l_rgw_lc_per_bucket_obj_pending, completed);
-    }
-  }
-
   void flush_actions() {
     if (!perf_counters) return;
     uint64_t v;
@@ -143,6 +128,32 @@ struct LCBatchCounters {
     if ((v = obj_mpu_aborted.exchange(0, std::memory_order_relaxed)) > 0) {
       perf_counters->inc(l_rgw_lc_per_bucket_obj_mpu_aborted, v);
     }
+  }
+
+  /*
+   * Non-blocking: a contending stream skips; counts stay in the
+   * atomic accumulators for the next flush or flush_guard.
+   *
+   * Capture order: completed before scanned so any scan-complete pair
+   * racing during the flush lands its scan in this S (or a later one),
+   * never as a dec without a paired inc.
+   * Apply order: inc(scanned) before dec(completed) so the pending
+   * gauge never dips below pending_pre during the flush.
+   */
+  void flush_all() {
+    if (!perf_counters) return;
+    std::unique_lock<std::mutex> l(flush_mutex, std::try_to_lock);
+    if (!l.owns_lock()) return;
+    uint64_t completed = obj_completed.exchange(0, std::memory_order_relaxed);
+    uint64_t scanned = obj_scanned.exchange(0, std::memory_order_relaxed);
+    if (scanned > 0) {
+      perf_counters->inc(l_rgw_lc_per_bucket_obj_scanned, scanned);
+      perf_counters->inc(l_rgw_lc_per_bucket_obj_pending, scanned);
+    }
+    if (completed > 0) {
+      perf_counters->dec(l_rgw_lc_per_bucket_obj_pending, completed);
+    }
+    flush_actions();
   }
 };
 
@@ -296,33 +307,90 @@ bool RGWLifecycleConfiguration::valid()
   return true;
 }
 
+/*
+ * Cloud-tier transitions cache the names of target buckets they've
+ * already created. The cache is per-thread so helpers (which run on
+ * different threads than the coordinator) don't race a shared set.
+ */
+static std::set<std::string>& get_cloud_targets() {
+  static thread_local std::set<std::string> tls_cloud_targets;
+  return tls_cloud_targets;
+}
+
 void *RGWLC::LCWorker::entry() {
+  std::unique_ptr<rgw::sal::Bucket> all_buckets;
+
+  // Deadline for the next scheduled traversal; help-wakes don't reset it.
+  utime_t next_lc_eligible = ceph_clock_now();
+
   do {
-    std::unique_ptr<rgw::sal::Bucket> all_buckets; // empty restriction
-    utime_t start = ceph_clock_now();
-    if (should_work(start)) {
+    // Snapshot fanout_gen; recheck under wait lock to avoid missed notify.
+    const uint64_t snap = lc->fanout_gen.load(std::memory_order_relaxed);
+
+    /*
+     * Scheduled work first; helping kicks in only after, so a worker
+     * with its own scheduled buckets never defers to help a peer.
+     */
+    utime_t now = ceph_clock_now();
+    bool ran_scheduled = false;
+    if (now >= next_lc_eligible && should_work(now)) {
       ldpp_dout(dpp, 2) << "life cycle: start worker=" << ix << dendl;
       int r = lc->process(this, all_buckets, false /* once */);
       if (r < 0) {
         ldpp_dout(dpp, 0) << "ERROR: do life cycle process() returned error r="
-			  << r << " worker=" << ix << dendl;
+                          << r << " worker=" << ix << dendl;
       }
       ldpp_dout(dpp, 2) << "life cycle: stop worker=" << ix << dendl;
-      cloud_targets.clear(); // clear cloud targets
+      get_cloud_targets().clear();
+      ran_scheduled = true;
     }
-    if (lc->going_down())
-      break;
+    if (lc->going_down()) break;
 
+    /*
+     * After our own scheduled work, help any peer fan-outs. Listers
+     * in the helper's stream check between shards: once this worker's
+     * next_lc_eligible has arrived and the LC window is open, each
+     * lister exits before claiming its next shard. A lister mid-shard
+     * finishes that shard before bailing, so spill is bounded by the
+     * longest in-progress shard per lister, not the full fan-out
+     * drain.
+     */
+    lc->help_until_drained(this, next_lc_eligible);
+    if (lc->going_down()) break;
+    get_cloud_targets().clear();
+
+    /*
+     * Push next_lc_eligible forward when we ran or when we're outside
+     * the window. Skip the push only when still inside-window but
+     * didn't run (helping spanned the open) — leaving the deadline
+     * alone lets the next iteration pick up today's traversal.
+     */
     utime_t end = ceph_clock_now();
-    int secs = schedule_next_start_time(start, end);
-    utime_t next;
-    next.set_from_double(end + secs);
+    if (ran_scheduled || !should_work(end)) {
+      int secs = schedule_next_start_time(now, end);
+      next_lc_eligible = end;
+      next_lc_eligible.set_from_double(double(end) + secs);
+    }
+
+    utime_t now2 = ceph_clock_now();
+    if (now2 >= next_lc_eligible) {
+      continue;
+    }
+    int wait_secs = int(double(next_lc_eligible) - double(now2));
 
     ldpp_dout(dpp, 5) << "schedule life cycle next start time="
-		      << rgw_to_asctime(next) << " worker=" << ix << dendl;
+                      << rgw_to_asctime(next_lc_eligible)
+                      << " worker=" << ix << dendl;
 
-    std::unique_lock l{lock};
-    cond.wait_for(l, std::chrono::seconds(secs));
+    std::unique_lock<std::mutex> l(lc->fanout_lock);
+    if (lc->fanout_gen.load(std::memory_order_relaxed) != snap) {
+      continue;
+    }
+    lc->fanout_cv.wait_for(l, std::chrono::seconds(wait_secs),
+        [this, snap]{
+          return lc->going_down() ||
+                 lc->fanout_gen.load(std::memory_order_relaxed) != snap;
+        });
   } while (!lc->going_down());
 
   return NULL;
@@ -446,19 +514,6 @@ static bool pass_object_lock_check(rgw::sal::Driver* driver, rgw::sal::Object* o
   }
 }
 
-/**
- * Determines whether to use unordered listing for lifecycle processing.
- *
- * For buckets with low shard counts, ordered listing is preferred due to better
- * performance
- *
- * For buckets with high shard counts, unordered listing is preferred to avoid
- * excess OSD requests
- */
-static bool should_list_unordered(const rgw::bucket_index_layout_generation& current_index, uint64_t threshold) {
-  return current_index.layout.type == rgw::BucketIndexType::Normal
-    && rgw::num_shards(current_index.layout.normal) > threshold;
-}
 class LCObjsLister {
   rgw::sal::Driver* driver;
   rgw::sal::Bucket* bucket;
@@ -469,19 +524,30 @@ class LCObjsLister {
   rgw_bucket_dir_entry pre_obj;
   uint64_t num_noncurrent{0};
   int64_t delay_ms;
+  /*
+   * Last fetch error (0 = none). Lets the caller distinguish a clean
+   * end-of-stream from a mid-listing failure.
+   */
+  int last_err{0};
 
 public:
   LCObjsLister(rgw::sal::Driver* _driver, rgw::sal::Bucket* _bucket) :
       driver(_driver), bucket(_bucket) {
     list_params.list_versions = bucket->versioned();
-
-    CephContext* cct = driver->ctx();
-    uint64_t threshold = cct->_conf.get_val<uint64_t>("rgw_lc_ordered_list_threshold");
-
-    const auto& current_index = bucket->get_info().layout.current_index;
-    list_params.allow_unordered = should_list_unordered(current_index, threshold);
-
+    list_params.allow_unordered = false;
     delay_ms = driver->ctx()->_conf.get_val<int64_t>("rgw_lc_thread_delay");
+  }
+
+  /*
+   * One producer, one bucket-index shard. Each shard is naturally
+   * ordered, and every version of a key lives in one shard, so the
+   * version-adjacency the lifecycle code relies on is preserved
+   * within the shard.
+   */
+  LCObjsLister(rgw::sal::Driver* _driver, rgw::sal::Bucket* _bucket,
+               int shard_id) : LCObjsLister(_driver, _bucket) {
+    list_params.shard_id = shard_id;
+    list_params.allow_unordered = true;
   }
 
   void set_prefix(const string& p) {
@@ -506,6 +572,8 @@ public:
     return 0;
   }
 
+  int last_error() const { return last_err; }
+
   void delay(const DoutPrefixProvider* dpp) {
     if (delay_ms) {
       maybe_warn_about_blocking(dpp);
@@ -526,6 +594,7 @@ public:
         list_params.marker = pre_obj.key;
         int ret = fetch(dpp, y);
         if (ret < 0) {
+          last_err = ret;
           ldpp_dout(dpp, 0) << "ERROR: list_op returned ret=" << ret
 				 << dendl;
           return false;
@@ -576,6 +645,19 @@ public:
   uint64_t get_num_noncurrent() { return num_noncurrent; }
 }; /* LCObjsLister */
 
+/*
+ * Per-entry snapshot of lister-derived fields. Captured by the producer
+ * immediately after fetching an entry, passed by value to the action
+ * coroutine. Lets actions run without holding any reference back to the
+ * lister, so the lister can live in a different coroutine or thread.
+ */
+struct ListedEntryCtx {
+  rgw_bucket_dir_entry           o;
+  boost::optional<std::string>   next_key_name;
+  uint64_t                       num_noncurrent{0};
+  ceph::real_time                effective_mtime{};
+};
+
 struct op_env {
 
   using LCWorker = RGWLC::LCWorker;
@@ -584,12 +666,10 @@ struct op_env {
   rgw::sal::Driver* driver;
   LCWorker* worker;
   rgw::sal::Bucket* bucket;
-  LCObjsLister& ol;
 
   op_env(lc_op& _op, rgw::sal::Driver* _driver, LCWorker* _worker,
-	 rgw::sal::Bucket* _bucket, LCObjsLister& _ol)
-    : op(_op), driver(_driver), worker(_worker), bucket(_bucket),
-      ol(_ol) {}
+	 rgw::sal::Bucket* _bucket)
+    : op(_op), driver(_driver), worker(_worker), bucket(_bucket) {}
 }; /* op_env */
 
 class LCRuleOp;
@@ -605,7 +685,6 @@ struct lc_op_ctx {
   rgw::sal::Driver* driver;
   rgw::sal::Bucket* bucket;
   lc_op& op; // ok--refers to expanded env.op
-  LCObjsLister& ol;
 
   std::unique_ptr<rgw::sal::Object> obj;
   RGWObjectCtx octx;
@@ -623,7 +702,7 @@ struct lc_op_ctx {
             LCBatchCounters* batch_counters)
     : cct(env.driver->ctx()), env(env), o(o), next_key_name(next_key_name),
       num_noncurrent(num_noncurrent), effective_mtime(effective_mtime),
-      driver(env.driver), bucket(env.bucket), op(env.op), ol(env.ol),
+      driver(env.driver), bucket(env.bucket), op(env.op),
       octx(env.driver), dpp(dpp), batch_counters(batch_counters)
     {
       obj = bucket->get_object(o.key);
@@ -821,8 +900,12 @@ public:
    *   second one. So check() should return true for the second action at that point,
    *   but should_process() if the action has already been applied. In object removal
    *   it doesn't matter, but in object transition it does.
+   *
+   * Reads per-call state from oc (set by check()). Must NOT depend on
+   * mutable state on the action object itself, because shared_ptr<LCOpAction>
+   * is shared across action coroutines and helper threads.
    */
-  virtual bool should_process() {
+  virtual bool should_process(const lc_op_ctx& oc) {
     return true;
   }
 
@@ -845,9 +928,6 @@ class LCOpRule {
   friend class LCOpAction;
 
   op_env env;
-  boost::optional<std::string> next_key_name;
-  uint64_t num_noncurrent;
-  ceph::real_time effective_mtime;
 
   std::vector<shared_ptr<LCOpFilter> > filters; // n.b., sharing ovhd
   std::vector<shared_ptr<LCOpAction> > actions;
@@ -863,17 +943,12 @@ public:
     return env.op;
   }
 
-  boost::optional<std::string> get_next_key_name() {
-    return next_key_name;
-  }
-
   std::vector<shared_ptr<LCOpAction>>& get_actions() {
     return actions;
   }
 
   void build();
-  void update();
-  int process(rgw_bucket_dir_entry& o, const DoutPrefixProvider *dpp,
+  int process(const ListedEntryCtx& lec, const DoutPrefixProvider *dpp,
               LCBatchCounters* batch_counters, optional_yield y,
               const RGWObjTags* cached_tags = nullptr);
 }; /* LCOpRule */
@@ -904,11 +979,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
    * take advantage of unordered listing optimizations--such as
    * operating on one shard at a time */
 
-  uint64_t threshold = cct->_conf.get_val<uint64_t>("rgw_lc_ordered_list_threshold");
-
-  const auto& current_index = target->get_info().layout.current_index;
-  params_base.allow_unordered = should_list_unordered(current_index, threshold);
-
+  params_base.allow_unordered = true;
   params_base.ns = RGW_OBJ_NS_MULTIPART;
   params_base.access_list_filter = MultipartMetaFilter;
 
@@ -968,9 +1039,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
   auto flush_guard = make_scope_guard(
     [batch_counters]
       {
-        batch_counters->flush_scanned();
-        batch_counters->flush_completed();
-        batch_counters->flush_actions();
+        batch_counters->flush_all();
       }
     );
 
@@ -1025,9 +1094,7 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
          * obj_scanned >= obj_completed always holds at flush time.
          */
         if (batch_threshold > 0 && (mpu_count % batch_threshold) == 0) {
-          batch_counters->flush_scanned();
-          batch_counters->flush_completed();
-          batch_counters->flush_actions();
+          batch_counters->flush_all();
         }
 
         if (going_down()) {
@@ -1372,7 +1439,6 @@ public:
 
 class LCOpAction_Transition : public LCOpAction {
   transition_action transition;
-  bool need_to_process{false};
 
 protected:
   virtual bool check_current_state(bool is_current) = 0;
@@ -1414,15 +1480,12 @@ public:
 			  << is_expired << " " << " size_check_p: "
 			  << size_check_p << dendl;
 
-    need_to_process =
-      (rgw_placement_rule::get_canonical_storage_class(o.meta.storage_class) !=
-       transition.storage_class);
-
     return is_expired && size_check_p;
   }
 
-  bool should_process() override {
-    return need_to_process;
+  bool should_process(const lc_op_ctx& oc) override {
+    return rgw_placement_rule::get_canonical_storage_class(
+               oc.o.meta.storage_class) != transition.storage_class;
   }
 
   int delete_tier_obj(lc_op_ctx& oc, optional_yield y) {
@@ -1489,7 +1552,7 @@ public:
     auto size = obj->get_size();
 
     ret = oc.obj->transition_to_cloud(oc.bucket, oc.tier.get(), oc.o,
-				      oc.env.worker->get_cloud_targets(),
+				      get_cloud_targets(),
 				      oc.cct, !delete_object, oc.dpp, y);
     if (ret < 0) {
       return ret;
@@ -1712,20 +1775,15 @@ void LCOpRule::build()
   }
 }
 
-void LCOpRule::update()
-{
-  next_key_name = env.ol.next_key_name();
-  num_noncurrent = env.ol.get_num_noncurrent();
-  effective_mtime = env.ol.get_prev_obj().meta.mtime;
-}
-
-int LCOpRule::process(rgw_bucket_dir_entry& o,
+int LCOpRule::process(const ListedEntryCtx& lec,
 		      const DoutPrefixProvider *dpp,
 		      LCBatchCounters* batch_counters,
                       optional_yield y,
 		      const RGWObjTags* cached_tags)
 {
-  lc_op_ctx ctx(env, o, next_key_name, num_noncurrent, effective_mtime, dpp, batch_counters);
+  rgw_bucket_dir_entry o = lec.o;
+  lc_op_ctx ctx(env, o, lec.next_key_name, lec.num_noncurrent,
+                lec.effective_mtime, dpp, batch_counters);
   ctx.cached_tags = cached_tags;
   shared_ptr<LCOpAction> *selected = nullptr; // n.b., req'd by sharing
   real_time exp;
@@ -1742,7 +1800,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
   }
 
   if (selected &&
-      (*selected)->should_process()) {
+      (*selected)->should_process(ctx)) {
 
     /*
      * Calling filter checks after action checks because
@@ -1769,7 +1827,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
 
     int r = (*selected)->process(ctx, y);
     if (r < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: remove_expired_obj " 
+      ldpp_dout(dpp, 0) << "ERROR: remove_expired_obj "
 			<< env.bucket << ":" << o.key
 			<< " " << cpp_strerror(r) << dendl;
       return r;
@@ -1780,6 +1838,371 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
 
   return 0;
 
+}
+
+/*
+ * Per-fan-out shared state on the coord's stack. Helpers reference via
+ * raw pointer; lifetime is pinned by active_helpers, drained by the
+ * coord (helpers_done_cv) before teardown.
+ */
+struct LCShardWork {
+  RGWLC* lc;
+  rgw::sal::Driver* driver;
+  rgw::sal::Bucket* bucket;
+  std::string prefix;
+  bool unsharded{false};
+
+  // Coord's session stop budget; helpers honor it (they produce for coord).
+  time_t stop_at{0};
+  bool once{false};
+
+  // Coord-stack-owned; helper-leave-wait in unregister_fanout pins lifetime.
+  const std::vector<LCOpRule>* rules{nullptr};
+  LCBatchCounters* batch_counters{nullptr};
+
+  // Contiguous shard range [0, total_shards); fetch_add to claim, -1 = drained.
+  std::atomic<int> next_shard{0};
+  int total_shards{0};
+
+  int max_helpers;
+  std::atomic<int> active_helpers{0};
+  std::mutex helpers_done_mutex;
+  std::condition_variable helpers_done_cv;
+
+  // First non-zero wins; non-zero also signals abort.
+  std::atomic<int> error{0};
+
+  LCShardWork(RGWLC* lc_, rgw::sal::Driver* d, rgw::sal::Bucket* b,
+              std::string p, bool unsharded_, int total, int max_h,
+              const std::vector<LCOpRule>* r, LCBatchCounters* bc,
+              time_t stop_at_, bool once_)
+    : lc(lc_), driver(d), bucket(b), prefix(std::move(p)),
+      unsharded(unsharded_),
+      stop_at(stop_at_), once(once_),
+      rules(r), batch_counters(bc),
+      total_shards(total),
+      max_helpers(max_h)
+  {}
+
+  bool pending_empty() const {
+    return next_shard.load(std::memory_order_relaxed) >= total_shards;
+  }
+  int pop_shard() {
+    int s = next_shard.fetch_add(1, std::memory_order_relaxed);
+    return s < total_shards ? s : -1;
+  }
+
+  /* First-error-wins. All listing error paths route through here. */
+  bool set_error_once(int err) {
+    int expected = 0;
+    return error.compare_exchange_strong(expected, err);
+  }
+
+  // Caller holds fanout_lock so work can't unregister between lookup and grab.
+  bool try_join_helper() {
+    int cur = active_helpers.load();
+    while (cur < max_helpers) {
+      if (active_helpers.compare_exchange_weak(cur, cur + 1)) return true;
+    }
+    return false;
+  }
+
+  /*
+   * Capture lc before decrement and serialize decrement-and-notify with
+   * the mutex coord waits on; otherwise coord could destroy us mid-notify.
+   */
+  void leave_helper() {
+    RGWLC* keep_lc = lc;
+    {
+      std::lock_guard<std::mutex> l(helpers_done_mutex);
+      int prev = active_helpers.fetch_sub(1);
+      if (prev == 1) {
+        helpers_done_cv.notify_all();
+      }
+    }
+    keep_lc->notify_helper_slot_freed();
+  }
+};
+
+/*
+ * Body of one listing coroutine: drain the shared shard queue, list each,
+ * spawn an action coroutine per entry, threshold-flush on local count.
+ * Owns its own spawn_throttle for action coroutines: spawn_throttle is
+ * not thread-safe and must have a single owner, so each lister gets its own.
+ */
+static void run_lister(LCShardWork* work,
+                       size_t wp_limit,
+                       uint64_t batch_threshold,
+                       RGWLC::LCWorker* helper_for_bail,
+                       utime_t scheduled_due,
+                       boost::asio::yield_context y)
+{
+  RGWLC* lc = work->lc;
+  rgw::sal::Driver* driver = work->driver;
+  LCBatchCounters* batch_counters = work->batch_counters;
+  const std::vector<LCOpRule>& rules = *work->rules;
+  const DoutPrefixProvider* dpp = lc;
+  ceph::async::spawn_throttle workpool{y, wp_limit};
+  uint64_t local_scanned = 0;
+
+  while (work->error.load() == 0 && !lc->going_down()) {
+    if (worker_should_stop(work->stop_at, work->once)) break;
+    /*
+     * Helper-only between-shards bail: when a helper has joined this
+     * stream and its own LC window has just opened, this lister exits
+     * without claiming further shards so the helper can return to its
+     * scheduled traversal. Unclaimed shards stay in the shared queue
+     * (popped later by the coord, other helpers, or this helper on
+     * re-join). No shards are lost. Coord passes nullptr/zero so this
+     * is a no-op for it.
+     */
+    if (helper_for_bail && !scheduled_due.is_zero()) {
+      utime_t now = ceph_clock_now();
+      if (now >= scheduled_due && helper_for_bail->should_work(now)) {
+        break;
+      }
+    }
+    int sid = work->pop_shard();
+    if (sid < 0) break;
+
+    auto ol = work->unsharded
+        ? LCObjsLister(driver, work->bucket)
+        : LCObjsLister(driver, work->bucket, sid);
+    ol.set_prefix(work->prefix);
+    int r = ol.init(dpp, y);
+    if (r == -ENOENT) continue;
+    if (r < 0) {
+      work->set_error_once(r);
+      break;
+    }
+
+    int budget_check_counter = 0;
+    rgw_bucket_dir_entry* o{nullptr};
+    while (ol.get_obj(dpp, y, &o)) {
+      if (work->error.load() != 0 || lc->going_down()) break;
+      if (++budget_check_counter % 100 == 0 &&
+          worker_should_stop(work->stop_at, work->once)) {
+        break;
+      }
+      ListedEntryCtx lec{
+        .o              = *o,
+        .next_key_name  = ol.next_key_name(),
+        .num_noncurrent = ol.get_num_noncurrent(),
+        .effective_mtime= ol.get_prev_obj().meta.mtime,
+      };
+
+      workpool.spawn([batch_counters, dpp, rules_copy=rules,
+                      lec=std::move(lec), bucket=work->bucket]
+                     (boost::asio::yield_context y) mutable {
+        const auto& obj = lec.o;
+        ldpp_dout(dpp, 20) << __func__ << "(): key=" << obj.key << dendl;
+        bool any_rule_needs_tags = std::any_of(
+            rules_copy.begin(), rules_copy.end(),
+            [](const LCOpRule& r) { return r.needs_tags(); });
+
+        boost::optional<RGWObjTags> cached_tags;
+        const RGWObjTags* cached_tags_ptr = nullptr;
+
+        if (any_rule_needs_tags && !obj.is_delete_marker()) {
+          bufferlist tags_bl;
+          rgw_obj_key obj_key = obj.key;
+          if (obj_key.instance.empty() && bucket->versioned() &&
+              !obj.is_current()) {
+            obj_key.instance = "null";
+          }
+          auto temp_obj = bucket->get_object(obj_key);
+          std::unique_ptr<rgw::sal::Object::ReadOp> rop = temp_obj->get_read_op();
+          int ret = rop->get_attr(dpp, RGW_ATTR_TAGS, tags_bl, y);
+          if (ret == 0) {
+            try {
+              cached_tags.emplace();
+              auto iter = tags_bl.cbegin();
+              cached_tags->decode(iter);
+              cached_tags_ptr = &*cached_tags;
+            } catch (buffer::error&) {
+              ldpp_dout(dpp, 5) << "ERROR: decode tags for " << obj.key << dendl;
+            }
+          }
+        }
+
+        for (auto& rule : rules_copy) {
+          if (rule.needs_tags() && !obj.is_delete_marker() &&
+              cached_tags_ptr &&
+              !has_all_tags(rule.get_op(), *cached_tags_ptr)) {
+            continue;
+          }
+          if (rule.needs_tags() && !obj.is_delete_marker() &&
+              !cached_tags_ptr) {
+            continue;
+          }
+          int ret = rule.process(lec, dpp, batch_counters, y, cached_tags_ptr);
+          if (ret < 0) {
+            ldpp_dout(dpp, 20) << "ERROR: rule.process() ret=" << ret
+                               << " bucket=" << bucket->get_name() << dendl;
+          }
+        }
+
+        batch_counters->decrement_pending();
+      });
+
+      ol.next();
+
+      batch_counters->increment_scanned();
+      if (batch_threshold > 0 &&
+          (++local_scanned % batch_threshold) == 0) {
+        batch_counters->flush_all();
+      }
+    }
+    if (int r2 = ol.last_error(); r2 < 0) {
+      work->set_error_once(r2);
+      break;
+    }
+  }
+  workpool.wait();
+}
+
+/*
+ * Per-stream worker body. Coord runs in bucket_lc_process's yield;
+ * helpers run in per-helper io_contexts. Spawns rgw_lc_listers_per_stream
+ * listing coroutines that drain the shared shard queue concurrently;
+ * each lister owns its action workpool. Per-lister wp budget is the
+ * stream's rgw_lc_max_wp_worker split across listers, so total action
+ * concurrency per stream stays bounded by the operator's setting.
+ * Returns on drain, abort, or fatal listing error.
+ */
+static int process_lc_shards(LCShardWork* work,
+                             boost::asio::yield_context yield,
+                             uint64_t batch_threshold,
+                             RGWLC::LCWorker* helper_for_bail = nullptr,
+                             utime_t scheduled_due = utime_t())
+{
+  CephContext* cct = work->lc->get_cct();
+  size_t cfg = cct->_conf->rgw_lc_listers_per_stream;
+  size_t wp_total = cct->_conf->rgw_lc_max_wp_worker;
+  /*
+   * Cap listers at wp_total so total action concurrency
+   * (lister_count * wp_per_lister) never exceeds the operator's setting.
+   */
+  size_t lister_count = std::max<size_t>(1,
+      std::min({size_t(cfg), size_t(work->total_shards),
+                std::max<size_t>(1, wp_total)}));
+  size_t wp_per_lister = std::max<size_t>(1, wp_total / lister_count);
+  ceph::async::spawn_throttle listers{yield, lister_count};
+  for (size_t i = 0; i < lister_count; ++i) {
+    listers.spawn([work, wp_per_lister, batch_threshold,
+                   helper_for_bail, scheduled_due]
+                  (boost::asio::yield_context y) {
+      run_lister(work, wp_per_lister, batch_threshold,
+                 helper_for_bail, scheduled_due, y);
+    });
+  }
+  listers.wait();
+  return work->error.load();
+}
+
+void RGWLC::register_fanout(LCShardWork* w)
+{
+  {
+    std::lock_guard<std::mutex> l(fanout_lock);
+    active_fanouts.push_back(w);
+    fanout_gen.fetch_add(1, std::memory_order_relaxed);
+  }
+  fanout_cv.notify_all();
+}
+
+void RGWLC::unregister_fanout(LCShardWork* w)
+{
+  {
+    std::lock_guard<std::mutex> l(fanout_lock);
+    active_fanouts.remove(w);
+  }
+  /*
+   * Take the same mutex helpers use for their leave-and-notify. By
+   * the time the wait returns, no helper can be mid-notify or about
+   * to touch the work — safe to let the caller destroy it.
+   */
+  std::unique_lock<std::mutex> l(w->helpers_done_mutex);
+  w->helpers_done_cv.wait(l, [w]{
+    return w->active_helpers.load() == 0;
+  });
+}
+
+void RGWLC::notify_helper_slot_freed()
+{
+  /*
+   * Wake any worker that previously found every fan-out's helper
+   * slots full.
+   */
+  {
+    std::lock_guard<std::mutex> l(fanout_lock);
+    fanout_gen.fetch_add(1, std::memory_order_relaxed);
+  }
+  fanout_cv.notify_all();
+}
+
+void RGWLC::help_until_drained(LCWorker* worker, utime_t scheduled_due)
+{
+  while (!going_down()) {
+    utime_t now = ceph_clock_now();
+    if (!scheduled_due.is_zero() && now >= scheduled_due
+        && worker->should_work(now)) {
+      return;
+    }
+    /*
+     * Look up a candidate and join it under the same lock that controls
+     * removal from the registry. Once the join succeeds we hold a slot
+     * that pins the entry's lifetime, and it's safe to drop the lock
+     * and start working.
+     */
+    LCShardWork* picked = nullptr;
+    {
+      std::lock_guard<std::mutex> l(fanout_lock);
+      for (auto* cand : active_fanouts) {
+        if (cand->error.load(std::memory_order_acquire) != 0) continue;
+        if (cand->pending_empty()) continue;
+        if (cand->try_join_helper()) {
+          picked = cand;
+          break;
+        }
+      }
+    }
+    if (!picked) return;
+
+    LCShardWork* w = picked;
+    auto leave_guard = make_scope_guard([&]{ w->leave_helper(); });
+
+    /*
+     * Helper runs its own io_context for the duration of this assist.
+     * Inside, it spawns a stream coroutine that drains shards and
+     * spawns action coroutines onto a per-helper workpool — exactly
+     * what the coordinator does, just on a separate thread/context.
+     * ctx.run() returns when the stream coroutine and all spawned
+     * actions complete.
+     */
+    boost::asio::io_context ctx;
+    boost::asio::spawn(ctx,
+        [this, w, worker, scheduled_due](boost::asio::yield_context y) {
+          return process_lc_shards(w, y,
+                                   cct->_conf->rgw_lc_counters_batch_size,
+                                   worker, scheduled_due);
+        },
+        [w](std::exception_ptr eptr, auto) {
+          if (eptr) {
+            try { std::rethrow_exception(eptr); }
+            catch (const std::exception& e) {
+              ldout(w->lc->get_cct(), 0)
+                << "ERROR: lc helper coroutine threw: " << e.what() << dendl;
+            } catch (...) {
+              ldout(w->lc->get_cct(), 0)
+                << "ERROR: lc helper coroutine threw non-std exception"
+                << dendl;
+            }
+            w->set_error_once(-EIO);
+          }
+        });
+    auto enable_warnings = warn_about_blocking_in_scope{};
+    ctx.run();
+  }
 }
 
 int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
@@ -1862,13 +2285,6 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   }
 
   /*
-   * total_objects_scanned tracks total objects for the modulo flush
-   * pattern; obj_scanned resets on each flush so it can't be used
-   * for modulo.
-   */
-  uint64_t total_objects_scanned = 0;
-
-  /*
    * Flush counters after workers complete on all exit paths.
    * flush_guard is declared first so it is destroyed last (after
    * stack_guard waits for workers to finish).
@@ -1876,9 +2292,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
   auto flush_guard = make_scope_guard(
     [&batch_counters, &perf_counters]
       {
-        batch_counters.flush_scanned();
-        batch_counters.flush_completed();
-        batch_counters.flush_actions();
+        batch_counters.flush_all();
         if (perf_counters) {
           perf_counters->set(l_rgw_lc_per_bucket_end_time,
                              ceph_clock_now().sec());
@@ -1894,20 +2308,6 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
 
   /* fetch information for zone checks */
   rgw::sal::Zone* zone = driver->get_zone();
-
-  auto pf = [&bucket_name, &batch_counters](const DoutPrefixProvider* dpp, optional_yield y,
-                           LCOpRule& op_rule, rgw_bucket_dir_entry& o,
-                           const RGWObjTags* cached_tags) {
-    ldpp_dout(dpp, 20)
-      << __func__ << "(): key=" << o.key << dendl;
-    int ret = op_rule.process(o, dpp, &batch_counters, y, cached_tags);
-    if (ret < 0) {
-      ldpp_dout(dpp, 20)
-	<< "ERROR: orule.process() returned ret=" << ret
-	<< " bucket=" << bucket_name
-	<< dendl;
-    }
-  };
 
   multimap<string, lc_op>& prefix_map = config.get_prefix_map();
   ldpp_dout(this, 10) << __func__ <<  "() prefix_map size="
@@ -1941,9 +2341,6 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       pre_marker = next_marker;
     }
 
-    LCObjsLister ol(driver, bucket.get());
-    ol.set_prefix(prefix_iter->first);
-
     std::vector<lc_op*> active_ops;
     active_ops.reserve(prefix_iter->second.size());
 
@@ -1962,110 +2359,61 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
       continue;
     }
 
-    ret = ol.init(this, yield);
-    if (ret < 0) {
-      if (ret == (-ENOENT))
-        return 0;
-      ldpp_dout(this, 0) << "ERROR: driver->list_objects():" << dendl;
-      return ret;
-    }
-
     std::vector<LCOpRule> rules;
     rules.reserve(active_ops.size());
     for (auto* op : active_ops) {
-      op_env oenv(*op, driver, worker, bucket.get(), ol);
+      op_env oenv(*op, driver, worker, bucket.get());
       rules.emplace_back(oenv);
       rules.back().build(); // why can't ctor do it?
     }
 
-    rgw_bucket_dir_entry* o{nullptr};
-    for (auto offset = 0; ol.get_obj(this, yield, &o /* , fetch_barrier */); ++offset, ol.next()) {
-      const auto obj = *o;
+    /*
+     * Backends that ignore ListParams::shard_id can't fan out per-shard;
+     * collapse to a single full-bucket pass on those, matching historical
+     * serial behavior.
+     */
+    const bool can_fanout = driver->supports_lc_intra_bucket_fanout();
+    const auto& cur_idx = bucket->get_info().layout.current_index;
+    const uint32_t num_shards = (can_fanout
+        && cur_idx.layout.type == rgw::BucketIndexType::Normal)
+          ? rgw::num_shards(cur_idx.layout.normal) : 0;
+    /*
+     * Helpers beyond what's needed to cover the shard count provide no
+     * listing parallelism — extra listers immediately claim -1 and exit.
+     */
+    int max_helpers = 0;
+    if (can_fanout) {
+      const int K = cct->_conf->rgw_lc_listers_per_stream;
+      const int useful = std::max(0,
+          (int(num_shards) + K - 1) / K - 1);
+      max_helpers = std::min<int>(
+          cct->_conf->rgw_lc_max_helpers_per_bucket, useful);
+    }
 
-      // Update all rules to capture current lister state before spawning
-      for (auto& rule : rules) {
-        rule.update();
-      }
+    LCShardWork work(this, driver, bucket.get(), prefix_iter->first,
+                     !can_fanout, can_fanout ? (int)num_shards : 1,
+                     max_helpers, &rules, &batch_counters, stop_at, once);
+    /*
+     * Inner scope so the scope_guard's unregister_fanout drains helpers
+     * before work.error is read below: process_lc_shards returns when
+     * the shared shard queue is empty, but helpers may still be listing
+     * shards they popped earlier, and any helper-side error must be
+     * observable here.
+     */
+    {
+      register_fanout(&work);
+      auto unreg = make_scope_guard([this, &work]{ unregister_fanout(&work); });
+      process_lc_shards(&work, yield, batch_threshold);
+    }
 
-      // Spawn one coroutine per object to process all rules
-      workpool.spawn([&pf, &batch_counters, dpp=this, rules_copy=rules, obj, bucket=bucket.get()]
-                     (boost::asio::yield_context yield) mutable {
-        // Check if any rule needs tags so we only fetch once per object
-        bool any_rule_needs_tags = std::any_of(rules_copy.begin(), rules_copy.end(),
-          [](const LCOpRule& r) { return r.needs_tags(); });
-
-        boost::optional<RGWObjTags> cached_tags;
-        const RGWObjTags* cached_tags_ptr = nullptr;
-
-        if (any_rule_needs_tags && !obj.is_delete_marker()) {
-          bufferlist tags_bl;
-
-          rgw_obj_key obj_key = obj.key;
-          if (obj_key.instance.empty() && bucket->versioned() && !obj.is_current()) {
-            obj_key.instance = "null";
-          }
-
-          auto temp_obj = bucket->get_object(obj_key);
-          std::unique_ptr<rgw::sal::Object::ReadOp> rop = temp_obj->get_read_op();
-          int ret = rop->get_attr(dpp, RGW_ATTR_TAGS, tags_bl, yield);
-          if (ret == 0) {
-            try {
-              cached_tags.emplace();
-              auto iter = tags_bl.cbegin();
-              cached_tags->decode(iter);
-              cached_tags_ptr = &*cached_tags;
-            } catch (buffer::error& err) {
-              ldpp_dout(dpp, 5) << "ERROR: decode tags for " << obj.key << dendl;
-            }
-          }
-        }
-
-        for (auto& rule : rules_copy) {
-          if (rule.needs_tags() &&
-              !obj.is_delete_marker() &&
-              cached_tags_ptr &&
-              !has_all_tags(rule.get_op(), *cached_tags_ptr)) {
-            continue;
-          }
-
-          if (rule.needs_tags() &&
-              !obj.is_delete_marker() &&
-              !cached_tags_ptr) {
-            continue;
-          }
-
-          pf(dpp, yield, rule, const_cast<rgw_bucket_dir_entry&>(obj),
-             cached_tags_ptr);
-        }
-
-        // Decrement pending once per object, after all rules are evaluated
-        batch_counters.decrement_pending();
-      });
-
-      total_objects_scanned++;
-
-      batch_counters.increment_scanned();
-
-      /*
-       * Flush counters every batch_threshold objects.
-       * Flush scanned first, then completed; obj_scanned is incremented
-       * synchronously above before any worker decrement, so
-       * obj_scanned >= obj_completed always holds at flush time.
-       */
-      if (batch_threshold > 0 && (total_objects_scanned % batch_threshold) == 0) {
-        batch_counters.flush_scanned();
-        batch_counters.flush_completed();
-        batch_counters.flush_actions();
-      }
-
-      if ((offset % 100) == 0) {
-	if (worker_should_stop(stop_at, once)) {
-	  ldpp_dout(this, 5) << __func__ << " interval budget EXPIRED worker="
-			     << worker->ix << " bucket=" << bucket_name
-			     << dendl;
-	  return 0;
-	}
-      }
+    if (going_down()) {
+      return -ECANCELED;
+    }
+    if (worker_should_stop(stop_at, once)) {
+      return 0;
+    }
+    if (int e = work.error.load(); e < 0) {
+      return e;
     }
   }
 
@@ -2763,9 +3111,17 @@ void RGWLC::start_processor()
 
 void RGWLC::stop_processor()
 {
-  down_flag = true;
+  /*
+   * Set the shutdown flag under the wait-state lock. Workers' wait
+   * predicate reads both the flag and the generation, and a bare
+   * store could race a worker between predicate-check and sleep.
+   */
+  {
+    std::lock_guard<std::mutex> l(fanout_lock);
+    down_flag = true;
+  }
+  fanout_cv.notify_all();
   for (auto& worker : workers) {
-    worker->stop();
     worker->join();
   }
   workers.clear();
@@ -2779,12 +3135,6 @@ unsigned RGWLC::get_subsys() const
 std::ostream& RGWLC::gen_prefix(std::ostream& out) const
 {
   return out << "lifecycle: ";
-}
-
-void RGWLC::LCWorker::stop()
-{
-  std::lock_guard l{lock};
-  cond.notify_all();
 }
 
 bool RGWLC::going_down()

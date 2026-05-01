@@ -5,6 +5,9 @@
 
 #include <map>
 #include <array>
+#include <list>
+#include <mutex>
+#include <condition_variable>
 #include <string>
 #include <iostream>
 
@@ -567,6 +570,8 @@ WRITE_CLASS_ENCODER(RGWLifecycleConfiguration)
 
 namespace ceph::async { class spawn_throttle; }
 
+struct LCShardWork;
+
 class RGWLC : public DoutPrefixProvider {
   CephContext *cct;
   rgw::sal::Driver* driver;
@@ -577,6 +582,18 @@ class RGWLC : public DoutPrefixProvider {
   std::atomic<bool> down_flag = { false };
   std::string cookie;
 
+  /*
+   * Single mutex guarding the active-fan-out list, the wakeup cv, and
+   * the generation counter. Wakers bump the generation under this lock
+   * so a wait that starts just after a notify still observes the bump.
+   * Removal from active_fanouts is serialized with helper drain so an
+   * entry cannot be destroyed while a helper still holds a reference.
+   */
+  std::mutex fanout_lock;
+  std::condition_variable fanout_cv;
+  std::atomic<uint64_t> fanout_gen{0};
+  std::list<LCShardWork*> active_fanouts;
+
 public:
 
   class LCWorker : public Thread
@@ -585,17 +602,8 @@ public:
     CephContext *cct;
     RGWLC *lc;
     int ix;
-    std::mutex lock;
-    std::condition_variable cond;
-    /* save the target bucket names created as part of object transition
-     * to cloud. This list is maintained for the duration of each RGWLC::process()
-     * post which it is discarded. */
-    std::set<std::string> cloud_targets;
 
   public:
-
-    using lock_guard = std::lock_guard<std::mutex>;
-    using unique_lock = std::unique_lock<std::mutex>;
 
     LCWorker(const DoutPrefixProvider* dpp, CephContext *_cct, RGWLC *_lc,
 	     int ix);
@@ -606,10 +614,8 @@ public:
     }
 
     void *entry() override;
-    void stop();
     bool should_work(utime_t& now);
     int schedule_next_start_time(utime_t& start, utime_t& now);
-    std::set<std::string>& get_cloud_targets() { return cloud_targets; }
     virtual ~LCWorker() override;
 
     friend class RGWRados;
@@ -671,6 +677,11 @@ public:
   rgw::sal::Restore* get_restore() const { return sal_restore.get(); }
   unsigned get_subsys() const;
   std::ostream& gen_prefix(std::ostream& out) const;
+
+  void register_fanout(LCShardWork* w);
+  void unregister_fanout(LCShardWork* w);
+  void notify_helper_slot_freed();
+  void help_until_drained(LCWorker* worker, utime_t scheduled_due);
 
   private:
 

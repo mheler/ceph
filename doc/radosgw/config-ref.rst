@@ -85,6 +85,25 @@ the default value of 3.
 .. note:: Before increasing either of these values, validate the current
    Cluster performance and Ceph Object Gateway utilization.
 
+Two additional options control how a busy bucket is processed:
+
+.. confval:: rgw_lc_listers_per_stream
+.. confval:: rgw_lc_max_helpers_per_bucket
+
+:confval:`rgw_lc_listers_per_stream` (default 4) sets how many concurrent
+listing coroutines run within a single LC stream, each pulling bucket-index
+shards from a shared queue. The per-stream action workpool budget
+(``rgw_lc_max_wp_worker``) is split evenly across these listers.
+
+:confval:`rgw_lc_max_helpers_per_bucket` (default 2) caps how many idle
+LCWorker threads on the same RGW can join a busy bucket as helpers. Each
+helper runs its own listing+action stream, so per-bucket action concurrency
+is up to ``(1 + effective_helpers) * rgw_lc_max_wp_worker``. The per-stream
+budget is ``rgw_lc_max_wp_worker`` floor-divided across the listers, so the
+realised cap is exact only when ``rgw_lc_max_wp_worker`` is a multiple of
+``rgw_lc_listers_per_stream``. The effective helper count is bounded by
+``rgw_lc_max_worker - 1``. Set to 0 to disable helper participation.
+
 The lifecycle maintenance thread must also be enabled on at least one RGW
 daemon for each zone. 
 

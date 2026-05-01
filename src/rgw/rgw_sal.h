@@ -297,6 +297,8 @@ class Driver {
     virtual int initialize(CephContext *cct, const DoutPrefixProvider *dpp) = 0;
     /** Name of this driver provider (e.g., "rados") */
     virtual const std::string get_name() const = 0;
+    /** True if Bucket::list() honors ListParams::shard_id. */
+    virtual bool supports_lc_intra_bucket_fanout() const { return false; }
     /** Get cluster unique identifier */
     virtual std::string get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y) = 0;
     /** Get a User from a rgw_user.  Does not query driver for user info, so quick */

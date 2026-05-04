@@ -1297,7 +1297,6 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
 
   if (use_gc_thread && use_gc) {
     gc->start_processor();
-    obj_expirer->start_processor();
   }
 
   auto& current_period = svc.zone->get_current_period();
@@ -1392,9 +1391,6 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
   lc = new RGWLC();
   lc->initialize(cct, this->driver);
 
-  if (use_lc_thread)
-    lc->start_processor();
-
   restore = make_unique<rgw::restore::Restore>();
   ret = restore->initialize(cct, this->driver);
 
@@ -1403,17 +1399,11 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
     return ret;
   }
 
-  if (use_restore_thread)
-    restore->start_processor();
-
   cloud_delete = rgw::cloud_delete::make_cloud_delete();
   ret = cloud_delete->initialize(cct, this->driver);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: failed to initialize cloud delete queue" << dendl;
     return ret;
-  }
-  if (use_cloud_delete_thread) {
-    cloud_delete->start_processor();
   }
 
   quota_handler = RGWQuotaHandler::generate_handler(dpp, this->driver, quota_threads);
@@ -1440,10 +1430,6 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
   // disable reshard thread based on zone/zonegroup support
   run_reshard_thread = run_reshard_thread && svc.zone->can_reshard();
 
-  if (run_reshard_thread)  {
-    reshard->start_processor();
-  }
-
   index_completion_manager = new RGWIndexCompletionManager(this);
 
   if (run_notification_thread) {
@@ -1466,6 +1452,21 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y)
       v1_topic_migration.start(1);
     }
   }
+
+  // Background processors may issue object/index ops and publish
+  // notifications; start them only after all dependencies (quota_handler,
+  // index_completion_manager, tombstone_cache, notification subsystem,
+  // etc.) have been constructed.
+  if (use_lc_thread)
+    lc->start_processor();
+  if (use_restore_thread)
+    restore->start_processor();
+  if (use_cloud_delete_thread)
+    cloud_delete->start_processor();
+  if (run_reshard_thread)
+    reshard->start_processor();
+  if (use_gc_thread && use_gc)
+    obj_expirer->start_processor();
 
   return ret;
 }

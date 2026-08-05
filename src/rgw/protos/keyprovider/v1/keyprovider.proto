@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package keyprovider.v1;
+
+option go_package = "bits.linode.com/LinodeAPI/obj-endpoint/gen/proto/keyprovider/v1";
+
+// KeyProviderService serves endpoints for providing data-encryption-key (DEK).
+service KeyProviderService {
+  // Create returns a fresh DEK and the wrapped DEK (E-DEK) for storage.
+  rpc Create(CreateRequest) returns (CreateResponse);
+  // Decrypt unwraps an E-DEK and returns the plaintext DEK.
+  rpc Decrypt(DecryptRequest) returns (DecryptResponse);
+}
+
+message CreateRequest {
+  // required; This is for audit logging. not used for DEK generation.
+  string bucket_name = 1;
+  // required; This is Ceph's Bucket ID, not a bucket name.
+  string bucket_id = 2;
+}
+
+message CreateResponse {
+  // Raw 32-byte DEK.
+  bytes dek = 1;
+  // Wrapped DEK: opaque to RGW, stored as object metadata and passed back on
+  // Decrypt. bytes, not string: proto3 strings must be valid UTF-8, and the
+  // E-DEK format is free to go binary later.
+  bytes e_dek = 2;
+}
+
+message DecryptRequest {
+  // required; This is for audit logging. not used for decryption.
+  string bucket_name = 1;
+  // required; This is Ceph's Bucket ID, not a bucket name.
+  string bucket_id = 2;
+  // required; The wrapped DEK as returned by Create.
+  bytes e_dek = 3;
+}
+
+message DecryptResponse {
+  // Raw 32-byte DEK.
+  bytes dek = 1;
+}

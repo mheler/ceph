@@ -57,6 +57,15 @@ enum {
   l_rgw_kms_error_transient,
   l_rgw_kms_error_permanent,
   l_rgw_kms_error_secret_store,
+
+  l_rgw_keyprovider_create_ok,
+  l_rgw_keyprovider_create_fail,
+  l_rgw_keyprovider_create_lat,
+  l_rgw_keyprovider_decrypt_ok,
+  l_rgw_keyprovider_decrypt_fail,
+  l_rgw_keyprovider_decrypt_lat,
+  l_rgw_keyprovider_unavailable,
+
   l_rgw_last,
 };
 

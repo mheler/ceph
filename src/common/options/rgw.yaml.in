@@ -3609,6 +3609,39 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_crypt_sse_s3_keyprovider_uri
+  type: str
+  level: advanced
+  desc: URI for the SSE-S3 Key Provider service via gRPC.
+  long_desc: The gRPC server address of the Key Provider service used when
+    rgw_crypt_sse_s3_backend is 'keyprovider'. This value is passed unchanged
+    to grpc::CreateCustomChannel() so may be in any format supported by the
+    C++ gRPC library.
+  default: ipv4:127.0.0.1:50061
+  flags:
+  - runtime
+  services:
+  - rgw
+  see_also:
+  - rgw_crypt_sse_s3_backend
+  with_legacy: true
+- name: rgw_crypt_sse_s3_keyprovider_timeout_ms
+  type: uint
+  level: advanced
+  desc: Deadline in milliseconds for Key Provider gRPC calls.
+  long_desc: Each Create/Decrypt RPC to the Key Provider service is given this
+    deadline. Calls that exceed it fail the S3 operation rather than hang the
+    request. Read per call, so changes take effect at runtime.
+  default: 5000
+  min: 1
+  flags:
+  - runtime
+  services:
+  - rgw
+  see_also:
+  - rgw_crypt_sse_s3_backend
+  - rgw_crypt_sse_s3_keyprovider_uri
+  with_legacy: true
 - name: rgw_list_bucket_min_readahead
   type: int
   level: advanced

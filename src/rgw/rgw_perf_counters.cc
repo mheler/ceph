@@ -68,6 +68,14 @@ void add_rgw_frontend_counters(PerfCountersBuilder *pcb) {
   pcb->add_u64_counter(l_rgw_kms_error_permanent, "kms_error_permanent", "Permanent (e.g key not found) errors returned from KMS");
   pcb->add_u64_counter(l_rgw_kms_error_transient, "kms_error_transient", "Transient (e.g timeout, overloaded) errors returned from KMS");
   pcb->add_u64_counter(l_rgw_kms_error_secret_store, "kms_error_secret_store", "Secret store errors (e.g kernel keyring quota)");
+
+  pcb->add_u64_counter(l_rgw_keyprovider_create_ok, "keyprovider_create_ok", "Successful SSE-S3 keyprovider Create calls");
+  pcb->add_u64_counter(l_rgw_keyprovider_create_fail, "keyprovider_create_fail", "Failed SSE-S3 keyprovider Create calls");
+  pcb->add_time_avg(l_rgw_keyprovider_create_lat, "keyprovider_create_lat", "SSE-S3 keyprovider Create latency");
+  pcb->add_u64_counter(l_rgw_keyprovider_decrypt_ok, "keyprovider_decrypt_ok", "Successful SSE-S3 keyprovider Decrypt calls");
+  pcb->add_u64_counter(l_rgw_keyprovider_decrypt_fail, "keyprovider_decrypt_fail", "Failed SSE-S3 keyprovider Decrypt calls");
+  pcb->add_time_avg(l_rgw_keyprovider_decrypt_lat, "keyprovider_decrypt_lat", "SSE-S3 keyprovider Decrypt latency");
+  pcb->add_u64_counter(l_rgw_keyprovider_unavailable, "keyprovider_unavailable", "SSE-S3 keyprovider service unavailable errors");
 }
 
 void add_rgw_op_counters(PerfCountersBuilder *lpcb) {

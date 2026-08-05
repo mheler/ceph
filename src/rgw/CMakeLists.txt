@@ -327,6 +327,39 @@ if(WITH_RADOSGW_D4N)
   list(APPEND librgw_driver_srcs ${librgw_d4n_srcs})
 endif()
 
+if(WITH_RADOSGW_GRPC)
+  # protoc mirrors the .proto's path below the -I directory into the output
+  # directory, so the generated headers keep their "keyprovider/v1/" prefix
+  # and match the #includes in rgw_keyprovider_impl.cc.
+  set(keyprovider_proto_path "${CMAKE_CURRENT_SOURCE_DIR}/protos")
+  set(keyprovider_proto "${keyprovider_proto_path}/keyprovider/v1/keyprovider.proto")
+  set(keyprovider_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/protos")
+
+  set(keyprovider_proto_srcs "${keyprovider_gen_dir}/keyprovider/v1/keyprovider.pb.cc")
+  set(keyprovider_proto_hdrs "${keyprovider_gen_dir}/keyprovider/v1/keyprovider.pb.h")
+  set(keyprovider_grpc_srcs "${keyprovider_gen_dir}/keyprovider/v1/keyprovider.grpc.pb.cc")
+  set(keyprovider_grpc_hdrs "${keyprovider_gen_dir}/keyprovider/v1/keyprovider.grpc.pb.h")
+
+  add_custom_command(
+    OUTPUT "${keyprovider_proto_srcs}" "${keyprovider_proto_hdrs}"
+           "${keyprovider_grpc_srcs}" "${keyprovider_grpc_hdrs}"
+    # protoc creates the keyprovider/v1 package subdirectory but not this one.
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${keyprovider_gen_dir}"
+    COMMAND ${_PROTOBUF_PROTOC}
+      --grpc_out "${keyprovider_gen_dir}"
+      --cpp_out "${keyprovider_gen_dir}"
+      -I "${keyprovider_proto_path}"
+      --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
+      "${keyprovider_proto}"
+    DEPENDS "${keyprovider_proto}"
+    COMMENT "Generating C++ sources for keyprovider/v1/keyprovider.proto")
+
+  list(APPEND librgw_common_srcs
+    rgw_keyprovider_impl.cc
+    ${keyprovider_proto_srcs}
+    ${keyprovider_grpc_srcs})
+endif()
+
 if(WITH_RADOSGW_STANDALONE)
   find_package(LMDB REQUIRED)
   add_compile_definitions(LMDB_SAFE_NO_CPP_UTILITIES)
@@ -431,6 +464,24 @@ endif()
 if(WITH_JAEGER)
   add_dependencies(rgw_common jaeger_base)
   target_link_libraries(rgw_common PUBLIC jaeger_base)
+endif()
+
+if(WITH_RADOSGW_GRPC)
+  # The generated stub and gRPC headers stay private: only
+  # rgw_keyprovider_impl.cc includes them. The compile definition is PUBLIC
+  # because dependents (e.g. rgw_appmain.cc) compile #ifdef WITH_RADOSGW_GRPC
+  # code.
+  function(rgw_grpc_configure target)
+    target_include_directories(${target} PRIVATE "${keyprovider_gen_dir}")
+    target_link_libraries(${target} PRIVATE ${_GRPC_GRPCPP})
+    target_compile_definitions(${target} PUBLIC WITH_RADOSGW_GRPC)
+    if(_HAVE_ABSEIL)
+      # Keep opentelemetry-cpp's absl inline namespace in step with the one
+      # gRPC links, so they don't collide.
+      target_compile_definitions(${target} PUBLIC HAVE_ABSEIL)
+    endif()
+  endfunction()
+  rgw_grpc_configure(rgw_common)
 endif()
 
 if(WITH_RADOSGW_RADOS)
@@ -538,6 +589,11 @@ if(WITH_RADOSGW_STANDALONE)
   if(WITH_JAEGER)
     add_dependencies(rgw_common_standalone jaeger_base)
     target_link_libraries(rgw_common_standalone PUBLIC jaeger_base)
+  endif()
+
+  if(WITH_RADOSGW_GRPC)
+    # Built from the same librgw_common_srcs, so it needs the same setup.
+    rgw_grpc_configure(rgw_common_standalone)
   endif()
 endif()
 

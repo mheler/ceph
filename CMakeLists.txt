@@ -588,6 +588,11 @@ option(WITH_RADOSGW_RADOS "RADOS backend for Rados Gateway" ON)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
 option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
+# Makes gRPC and protobuf configure-time requirements for every WITH_RADOSGW
+# build, even when WITH_NVMEOF_GATEWAY_MONITOR_CLIENT is OFF; pass
+# -DWITH_RADOSGW_GRPC=OFF to build RGW without them.
+cmake_dependent_option(WITH_RADOSGW_GRPC
+  "gRPC support for RADOS Gateway (SSE-S3 key provider, ...)" ON WITH_RADOSGW OFF)
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
 option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)

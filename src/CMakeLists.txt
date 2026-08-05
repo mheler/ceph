@@ -1019,7 +1019,10 @@ endif(WITH_FUSE)
 # NVMEOF GATEWAY MONITOR CLIENT
 option(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT "build nvmeof gateway monitor client" ON)
 
-if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT)
+# gRPC and protobuf discovery, shared by the nvmeof gateway monitor client
+# below and by rgw, which is configured later by add_subdirectory(rgw) and so
+# inherits the _PROTOBUF_* and _GRPC_* variables set here.
+if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT OR WITH_RADOSGW_GRPC)
 
   # Prefer config mode so gRPC sees protobuf's full target set
   # (incl. upb); fall back to module mode.
@@ -1062,6 +1065,9 @@ if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT)
     # carries the same transitive dependency as the cmake-config gRPC::grpc++.
     target_link_libraries(PkgConfig::GRPCPP INTERFACE protobuf::libprotobuf)
   endif()
+endif()
+
+if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT)
 
   # Gateway Proto file
   get_filename_component(nvmeof_gateway_proto "nvmeof/gateway/control/proto/gateway.proto" ABSOLUTE)

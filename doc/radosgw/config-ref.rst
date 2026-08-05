@@ -280,6 +280,8 @@ SSE-S3 Settings
 .. confval:: rgw_crypt_sse_s3_vault_ssl_cacert
 .. confval:: rgw_crypt_sse_s3_vault_ssl_clientcert
 .. confval:: rgw_crypt_sse_s3_vault_ssl_clientkey
+.. confval:: rgw_crypt_sse_s3_keyprovider_uri
+.. confval:: rgw_crypt_sse_s3_keyprovider_timeout_ms
 
 KMS Secrets Cache Settings
 ==========================

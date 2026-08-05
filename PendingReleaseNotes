@@ -1,3 +1,11 @@
+* RGW: A new SSE-S3 key backend, selected with ``rgw_crypt_sse_s3_backend =
+  keyprovider``, obtains a fresh per-object data encryption key from a Key
+  Provider service over gRPC instead of deriving per-bucket keys from Vault.
+  See the SSE-S3 section of the radosgw encryption documentation. Builds gain
+  a ``WITH_RADOSGW_GRPC`` cmake option (default ON when RGW is built) that
+  makes gRPC and protobuf configure-time requirements; pass
+  ``-DWITH_RADOSGW_GRPC=OFF`` to build without them.
+
 * CephFS: The ``client_force_lazyio`` configuration option is now correctly marked
   as not supporting runtime updates. Previously, the configuration schema indicated
   this option could be changed at runtime, but changes had no effect on opened file

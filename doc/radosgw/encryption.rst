@@ -115,17 +115,66 @@ and :ref:`radosgw-kmip`.
 SSE-S3
 ======
 
-This makes key management invisible to the user.  They are still stored
-in Vault, but they are automatically created and deleted by Ceph and
-retrieved as required to serve requests to encrypt
-or decrypt data.
+This makes key management invisible to the user.  Keys are automatically
+created and deleted by Ceph and retrieved as required to serve requests to
+encrypt or decrypt data.
 
 This is implemented in S3 according to the `Amazon SSE-S3`_ specification.
 
-In principle, any key management service could be used here.  Currently
-only integration with `Vault`_, is implemented.
+Two key backends are implemented, selected with
+``rgw_crypt_sse_s3_backend``: Vault (``vault``, the default; see
+:ref:`radosgw-vault`) and the Key Provider gRPC service (``keyprovider``,
+below).
 
-See :ref:`radosgw-vault`.
+SSE-S3 with the Key Provider service
+------------------------------------
+
+In this mode the gateway obtains a fresh data encryption key (DEK) for every
+encrypted object write from a Key Provider service over gRPC, and stores only
+the *wrapped DEK* (E-DEK) in the object's metadata. On reads, the stored
+E-DEK is sent back to the Key Provider to be unwrapped. The Key Provider in
+turn derives per-bucket key encryption keys from rotating master secrets via
+a separate Key Manager service; none of that key hierarchy is visible to (or
+parseable by) the gateway, and no key material is persisted by RGW other than
+the opaque E-DEK::
+
+   RGW  --gRPC-->  Key Provider  --gRPC/mTLS-->  Key Manager
+
+Configuration::
+
+  rgw crypt sse s3 backend = keyprovider
+  rgw crypt sse s3 keyprovider uri = ipv4:127.0.0.1:50061
+
+Options (defined in the :doc:`configuration reference </radosgw/config-ref>`):
+:confval:`rgw_crypt_sse_s3_keyprovider_uri` and
+:confval:`rgw_crypt_sse_s3_keyprovider_timeout_ms`.
+
+The RGW-to-Key-Provider channel is plaintext by design: the Key Provider is
+deployed co-located with the gateway, so the hop never leaves the host. The
+default URI above is loopback TCP; a Unix domain socket (``unix:/path/to.sock``)
+is also accepted and additionally gates access by filesystem permissions.
+Transport security for the onward Key Manager hop is the Key Provider's
+responsibility.
+
+Encryption and decryption both dispatch on the currently configured
+``rgw_crypt_sse_s3_backend``, exactly as for the other SSE-S3 backends.
+Changing the backend on a cluster that already holds SSE-S3-encrypted
+objects is therefore **unsupported**: objects written by the previous
+backend become unreadable until the option is set back and the gateway
+restarted. No switch re-encrypts or migrates existing objects.
+
+In a multisite configuration, data sync replicates the ciphertext and the
+``user.rgw.crypt.*`` attributes verbatim. A peer zone can serve
+Key-Provider-encrypted objects only if its gateways also run with
+``rgw_crypt_sse_s3_backend = keyprovider`` against a Key Provider whose Key
+Manager holds the same master secrets; zones configured for a different
+SSE-S3 backend cannot decrypt them.
+
+This backend requires a build configured with
+``-DWITH_RADOSGW_GRPC=ON`` (the default when RADOS Gateway is enabled),
+which makes gRPC and protobuf configure-time build requirements for RGW;
+pass ``-DWITH_RADOSGW_GRPC=OFF`` to build without them. See
+:doc:`/dev/radosgw/sse-s3-keyprovider` for the developer documentation.
 
 Bucket Encryption APIs
 ======================

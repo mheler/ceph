@@ -17,6 +17,9 @@
 #include "rgw/rgw_perf_counters.h"
 #include "rgw_kms_cache.h"
 #include "rgw_string.h"
+#ifdef WITH_RADOSGW_GRPC
+#include "rgw/rgw_keyprovider.h"
+#endif
 #include <rapidjson/allocators.h>
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
@@ -1285,21 +1288,76 @@ int make_actual_key_from_kms(const DoutPrefixProvider *dpp,
   return reconstitute_actual_key_from_kms(dpp, attrs, kms_cache, y, actual_key);
 }
 
+#ifdef WITH_RADOSGW_GRPC
+
+/// The encrypt path in rgw_crypt.cc has already set RGW_ATTR_CRYPT_KEYID to
+/// the bucket marker, which the key manager uses as the KEK derivation salt.
+static int make_actual_key_from_keyprovider(const DoutPrefixProvider *dpp,
+                                            map<string, bufferlist>& attrs,
+                                            optional_yield y,
+                                            std::string& actual_key,
+                                            const std::string& bucket_name)
+{
+  std::string bucket_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
+  if (bucket_id.empty()) {
+    ldpp_dout(dpp, 0) << "ERROR: KeyProvider: no bucket id in " RGW_ATTR_CRYPT_KEYID << dendl;
+    return -EINVAL;
+  }
+  std::string e_dek;
+  // Writes straight into actual_key, as the vault engines do. Failures are
+  // logged by the client with the RPC name and bucket.
+  int r = rgw::keyprovider::create_dek(dpp, bucket_name, bucket_id,
+                                       actual_key, e_dek, y);
+  if (r < 0) {
+    return r;
+  }
+  set_attr(attrs, RGW_ATTR_CRYPT_DATAKEY, e_dek);
+  return 0;
+}
+
+/// The bucket id and E-DEK come from the object's attrs, never the request:
+/// the KEK is salted with the id of the bucket the object was encrypted in.
+static int reconstitute_actual_key_from_keyprovider(const DoutPrefixProvider *dpp,
+                                                    map<string, bufferlist>& attrs,
+                                                    optional_yield y,
+                                                    std::string& actual_key,
+                                                    const std::string& bucket_name)
+{
+  std::string bucket_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
+  std::string e_dek = get_str_attribute(attrs, RGW_ATTR_CRYPT_DATAKEY);
+  if (bucket_id.empty() || e_dek.empty()) {
+    ldpp_dout(dpp, 5) << "ERROR: KeyProvider: object lacks bucket id or E-DEK attributes; not decryptable by this RGW configuration" << dendl;
+    return -EINVAL;
+  }
+  // Failures are logged by the client with the RPC name and bucket.
+  return rgw::keyprovider::decrypt_dek(dpp, bucket_name, bucket_id, e_dek,
+                                       actual_key, y);
+}
+
+#endif // WITH_RADOSGW_GRPC
+
 int reconstitute_actual_key_from_sse_s3(const DoutPrefixProvider *dpp,
                                         map<string, bufferlist>& attrs,
                                         optional_yield y,
-                                        std::string& actual_key)
+                                        std::string& actual_key,
+                                        const std::string& bucket_name)
 {
   std::string key_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
   SseS3Context kctx { dpp->get_cct() };
   const std::string &kms_backend { kctx.backend() };
 
-  ldpp_dout(dpp, 20) << "Getting SSE-S3  encryption key for key " << key_id << dendl;
+  ldpp_dout(dpp, 20) << "Getting SSE-S3 encryption key for key " << key_id << dendl;
   ldpp_dout(dpp, 20) << "SSE-KMS backend is " << kms_backend << dendl;
 
   if (RGW_SSE_KMS_BACKEND_VAULT == kms_backend) {
     return reconstitute_actual_key_from_vault(dpp, kctx, attrs, y, actual_key);
   }
+#ifdef WITH_RADOSGW_GRPC
+  if (RGW_SSE_S3_BACKEND_KEYPROVIDER == kms_backend) {
+    return reconstitute_actual_key_from_keyprovider(dpp, attrs, y, actual_key,
+                                                    bucket_name);
+  }
+#endif
 
   ldpp_dout(dpp, 0) << "ERROR: Invalid rgw_crypt_sse_s3_backend: " << kms_backend << dendl;
   return -EINVAL;
@@ -1308,17 +1366,25 @@ int reconstitute_actual_key_from_sse_s3(const DoutPrefixProvider *dpp,
 int make_actual_key_from_sse_s3(const DoutPrefixProvider *dpp,
                                 map<string, bufferlist>& attrs,
                                 optional_yield y,
-                                std::string& actual_key)
+                                std::string& actual_key,
+                                const std::string& bucket_name)
 {
   SseS3Context kctx { dpp->get_cct() };
-  const std::string kms_backend { kctx.backend() };
-  if (RGW_SSE_KMS_BACKEND_VAULT != kms_backend) {
-    ldpp_dout(dpp, 0) << "ERROR: Unsupported rgw_crypt_sse_s3_backend: " << kms_backend << dendl;
-    return -EINVAL;
-  }
-  return make_actual_key_from_vault(dpp, kctx, attrs, y, actual_key);
-}
+  const std::string &kms_backend { kctx.backend() };
 
+  if (RGW_SSE_KMS_BACKEND_VAULT == kms_backend) {
+    return make_actual_key_from_vault(dpp, kctx, attrs, y, actual_key);
+  }
+#ifdef WITH_RADOSGW_GRPC
+  if (RGW_SSE_S3_BACKEND_KEYPROVIDER == kms_backend) {
+    return make_actual_key_from_keyprovider(dpp, attrs, y, actual_key,
+                                            bucket_name);
+  }
+#endif
+
+  ldpp_dout(dpp, 0) << "ERROR: Unsupported rgw_crypt_sse_s3_backend: " << kms_backend << dendl;
+  return -EINVAL;
+}
 
 int create_sse_s3_bucket_key(const DoutPrefixProvider *dpp,
                              const std::string& bucket_key,

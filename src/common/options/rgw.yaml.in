@@ -3463,15 +3463,18 @@ options:
 - name: rgw_crypt_sse_s3_backend
   type: str
   level: advanced
-  desc: Where the SSE-S3 encryption keys are stored. The only valid choice here is
-    HashiCorp Vault ('vault').
-  fmt_desc: Where the SSE-S3 encryption keys are stored. The only valid
-    choice is HashiCorp Vault (``vault``).
+  desc: Selects the mechanism by which SSE-S3 wrapped DEKs are obtained and
+    unwrapped. Valid choices are HashiCorp Vault ('vault') and the Key Provider
+    gRPC service ('keyprovider').
+  fmt_desc: Selects the mechanism by which SSE-S3 wrapped DEKs are obtained and
+    unwrapped. Valid choices are HashiCorp Vault (``vault``) and the Key Provider
+    gRPC service (``keyprovider``).
   default: vault
   services:
   - rgw
   enum_values:
   - vault
+  - keyprovider
   with_legacy: true
 
 - name: rgw_crypt_sse_s3_vault_secret_engine

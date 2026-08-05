@@ -27,6 +27,10 @@
 #include "include/str_list.h"
 #include "include/stringify.h"
 #include "rgw_kms_cache.h"
+#include "rgw_kms.h"
+#ifdef WITH_RADOSGW_GRPC
+#include "rgw_keyprovider.h"
+#endif
 #include "rgw_main.h"
 #include "rgw_asio_thread.h"
 #include "rgw_common.h"
@@ -440,6 +444,22 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter.reset(new ActiveRateLimiter{dpp->get_cct()});
   ratelimiter->start();
 
+  if (g_conf()->rgw_crypt_sse_s3_backend == RGW_SSE_S3_BACKEND_KEYPROVIDER) {
+#ifdef WITH_RADOSGW_GRPC
+    // Build the backend now rather than on first use, so a misconfigured
+    // gateway fails to start instead of failing every encrypted request.
+    if (rgw::keyprovider::init(dpp->get_cct()) < 0) {
+      derr << "ERROR: SSE-S3 key provider configuration is invalid" << dendl;
+      return -EINVAL;
+    }
+    dout(1) << "SSE-S3 key provider backend enabled" << dendl;
+#else
+    derr << "ERROR: rgw_crypt_sse_s3_backend is 'keyprovider' but this build was "
+            "configured with WITH_RADOSGW_GRPC=OFF" << dendl;
+    return -EINVAL;
+#endif
+  }
+
   // initialize RGWProcessEnv
   env.rest = &rest;
   env.auth_registry = rgw::auth::StrategyRegistry::create(
@@ -686,6 +706,9 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   rgw_shutdown_resolver();
   rgw_http_client_cleanup();
   rgw_kmip_client_cleanup();
+#ifdef WITH_RADOSGW_GRPC
+  rgw::keyprovider::cleanup();
+#endif
   rgw::curl::cleanup_curl();
   g_conf().remove_observer(implicit_tenant_context.get());
   implicit_tenant_context.reset(); // deletes

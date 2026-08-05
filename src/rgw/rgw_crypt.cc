@@ -1821,6 +1821,13 @@ static int get_sse_s3_bucket_key(req_state *s, optional_yield y,
   int res;
   std::string saved_key;
 
+  if (s->cct->_conf->rgw_crypt_sse_s3_backend == RGW_SSE_S3_BACKEND_KEYPROVIDER) {
+    // No per-bucket key: the provider mints a fresh DEK per object, and the
+    // bucket marker is what identifies it on read.
+    key_id = s->bucket->get_marker();
+    return 0;
+  }
+
   key_id = expand_key_name(s, s->cct->_conf->rgw_crypt_sse_s3_key_template);
 
   if (key_id == cant_expand_key) {
@@ -2287,7 +2294,8 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
         return -EINVAL;
       }
 
-      if (s->cct->_conf->rgw_crypt_sse_s3_backend != "vault") {
+      if (s->cct->_conf->rgw_crypt_sse_s3_backend != RGW_SSE_KMS_BACKEND_VAULT &&
+          s->cct->_conf->rgw_crypt_sse_s3_backend != RGW_SSE_S3_BACKEND_KEYPROVIDER) {
         s->err.message = "Request specifies Server Side Encryption "
             "but server configuration does not support this.";
         return -EINVAL;
@@ -2309,7 +2317,8 @@ int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
       set_attr(attrs, RGW_ATTR_CRYPT_CONTEXT, cooked_context);
       set_attr(attrs, RGW_ATTR_CRYPT_KEYID, key_id);
       std::string actual_key;
-      res = make_actual_key_from_sse_s3(s, attrs, y, actual_key);
+      res = make_actual_key_from_sse_s3(s, attrs, y, actual_key,
+                                        s->bucket->get_name());
       if (res != 0) {
         ldpp_dout(s, 5) << "ERROR: failed to retrieve actual key from key_id: " << key_id << dendl;
         s->err.message = "Failed to retrieve the actual key";
@@ -2890,7 +2899,8 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
     /* try to retrieve actual key */
     std::string key_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
     std::string actual_key;
-    res = reconstitute_actual_key_from_sse_s3(s, attrs, y, actual_key);
+    res = reconstitute_actual_key_from_sse_s3(s, attrs, y, actual_key,
+        s->bucket ? s->bucket->get_name() : std::string {});
     if (res != 0) {
       ldpp_dout(s, 10) << "ERROR: failed to retrieve actual key" << dendl;
       s->err.message = "Failed to retrieve the actual key";
@@ -2920,7 +2930,8 @@ int rgw_s3_prepare_decrypt(req_state* s, optional_yield y,
     /* try to retrieve actual key */
     std::string key_id = get_str_attribute(attrs, RGW_ATTR_CRYPT_KEYID);
     std::string actual_key;
-    res = reconstitute_actual_key_from_sse_s3(s, attrs, y, actual_key);
+    res = reconstitute_actual_key_from_sse_s3(s, attrs, y, actual_key,
+        s->bucket ? s->bucket->get_name() : std::string {});
     if (res != 0) {
       ldpp_dout(s, 10) << "ERROR: failed to retrieve actual key" << dendl;
       s->err.message = "Failed to retrieve the actual key";

@@ -22,6 +22,8 @@ static const std::string RGW_SSE_KMS_VAULT_SE_KV = "kv";
 
 static const std::string RGW_SSE_KMS_KMIP_SE_KV = "kv";
 
+static const std::string RGW_SSE_S3_BACKEND_KEYPROVIDER = "keyprovider";
+
 namespace rgw::kms {
   class KMSCache;
 }
@@ -46,14 +48,21 @@ int reconstitute_actual_key_from_kms(const DoutPrefixProvider *dpp,
                                      rgw::kms::KMSCache* kms_cache,
                                      optional_yield y,
                                      std::string& actual_key);
+/**
+ * Both dispatch on the configured rgw_crypt_sse_s3_backend. \p bucket_name is
+ * for the keyprovider backend's audit log only and may be empty on paths with
+ * no request context (lifecycle transition, reencrypt).
+ */
 int make_actual_key_from_sse_s3(const DoutPrefixProvider *dpp,
                                 std::map<std::string, bufferlist>& attrs,
                                 optional_yield y,
-                                std::string& actual_key);
+                                std::string& actual_key,
+                                const std::string& bucket_name = {});
 int reconstitute_actual_key_from_sse_s3(const DoutPrefixProvider *dpp,
                                         std::map<std::string, bufferlist>& attrs,
                                         optional_yield y,
-                                        std::string& actual_key);
+                                        std::string& actual_key,
+                                        const std::string& bucket_name = {});
 
 int create_sse_s3_bucket_key(const DoutPrefixProvider *dpp,
                              const std::string& actual_key,

@@ -1785,6 +1785,10 @@ std::string expand_key_name(req_state *s, const std::string_view&t)
     if (i == std::string_view::npos) {
       break;
     }
+    if (i + 1 >= t.size()) {
+      // A trailing '%' has no directive; reading t[i+1] would run off the end.
+      return cant_expand_key;
+    }
     if (t[i+1] == '%') {
       r.append("%");
       i += 2;

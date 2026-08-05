@@ -1583,6 +1583,25 @@ TEST(TestRGWCrypto, verify_transition_encrypt_decrypt_roundtrip)
   }
 }
 
+TEST(TestRGWCrypto, verify_expand_key_name)
+{
+  // none of these expand a directive, so the req_state is never dereferenced
+  req_state* const s = nullptr;
+  ASSERT_EQ("", expand_key_name(s, ""));
+  ASSERT_EQ("plain", expand_key_name(s, "plain"));
+  ASSERT_EQ("%", expand_key_name(s, "%%"));
+  ASSERT_EQ("a%b", expand_key_name(s, "a%%b"));
+  ASSERT_EQ("%%", expand_key_name(s, "%%%%"));
+  // a trailing '%' has no directive to expand
+  ASSERT_EQ(cant_expand_key, expand_key_name(s, "%"));
+  ASSERT_EQ(cant_expand_key, expand_key_name(s, "abc%"));
+  ASSERT_EQ(cant_expand_key, expand_key_name(s, "%%%"));
+  // unknown or truncated directives
+  ASSERT_EQ(cant_expand_key, expand_key_name(s, "%x"));
+  ASSERT_EQ(cant_expand_key, expand_key_name(s, "%bucket_i"));
+  ASSERT_EQ(cant_expand_key, expand_key_name(s, "prefix-%owner_i"));
+}
+
 int main(int argc, char **argv) {
   auto args = argv_to_vec(argc, argv);
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,

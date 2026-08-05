@@ -384,6 +384,13 @@ int rgw_prepare_reencrypt_object(const DoutPrefixProvider* dpp,
                                  std::unique_ptr<BlockCrypt>* block_crypt);
 
 
+/// The failure sentinel returned by expand_key_name().
+extern const std::string cant_expand_key;
+
+/// Expand the %-directives (%%, %bucket_id, %owner_id) in an SSE-S3 key
+/// template; returns cant_expand_key on a malformed template.
+std::string expand_key_name(req_state* s, const std::string_view& t);
+
 int rgw_s3_prepare_encrypt(req_state* s, optional_yield y,
                            std::map<std::string, ceph::bufferlist>& attrs,
                            std::unique_ptr<BlockCrypt>* block_crypt,

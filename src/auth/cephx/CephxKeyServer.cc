@@ -128,6 +128,11 @@ bool KeyServerData::get_service_secret(CephContext *cct, uint32_t service_id,
   ttl = std::min(ttl, static_cast<double>(
 		     secrets.secrets.rbegin()->second.expiration - now));
 
+  // Floor to whole seconds so the minted lifetime cannot exceed the key span.
+  const utime_t span = riter->second.expiration -
+                       riter->second.key.get_created();
+  ttl = std::min(ttl, static_cast<double>(span.sec()));
+
   ldout(cct, 30) << __func__ << " service "
 		 << ceph_entity_type_name(service_id) << " secret_id "
 		 << secret_id << " " << riter->second << " ttl " << ttl

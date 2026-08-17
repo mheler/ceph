@@ -84,11 +84,12 @@ WRITE_CLASS_ENCODER(AuthCapsInfo)
 struct AuthTicket {
   EntityName name;
   uint64_t global_id; /* global instance id */
+  uint64_t auid; /* decoded value; encode writes CEPH_AUTH_UID_DEFAULT */
   utime_t created, expires;
   AuthCapsInfo caps;
   __u32 flags;
 
-  AuthTicket() : global_id(0), flags(0){}
+  AuthTicket() : global_id(0), auid(CEPH_AUTH_UID_DEFAULT), flags(0) {}
 
   void init_timestamps(utime_t now, double ttl) {
     created = now;
@@ -257,7 +258,7 @@ public:
   virtual ~KeyStore() = default;
   virtual bool get_secret(const EntityName& name, CryptoKey& secret) const = 0;
   virtual bool get_service_secret(uint32_t service_id, uint64_t secret_id,
-				  CryptoKey& secret) const = 0;
+				  ExpiringCryptoKey& secret) const = 0;
 };
 
 inline bool auth_principal_needs_rotating_keys(EntityName& name)

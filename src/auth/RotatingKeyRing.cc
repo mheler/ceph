@@ -70,7 +70,7 @@ bool RotatingKeyRing::get_secret(const EntityName& name, CryptoKey& secret) cons
 }
 
 bool RotatingKeyRing::get_service_secret(uint32_t service_id_, uint64_t secret_id,
-					 CryptoKey& secret) const
+					 ExpiringCryptoKey& secret) const
 {
   ldout(cct, 30) << __func__ << ": service_id=" << service_id_ << " secret_id=" << secret_id << dendl;
 
@@ -89,7 +89,7 @@ bool RotatingKeyRing::get_service_secret(uint32_t service_id_, uint64_t secret_i
     return false;
   }
 
-  secret = iter->second.key;
+  secret = iter->second;
   return true;
 }
 

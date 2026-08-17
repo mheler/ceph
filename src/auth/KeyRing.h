@@ -54,7 +54,7 @@ public:
     return true;
   }
   bool get_service_secret(uint32_t service_id, uint64_t secret_id,
-			  CryptoKey& secret) const override {
+			  ExpiringCryptoKey& secret) const override {
     return false;
   }
   bool get_caps(const EntityName& name,

@@ -44,7 +44,7 @@ public:
   void wipe();
   bool get_secret(const EntityName& name, CryptoKey& secret) const override;
   bool get_service_secret(uint32_t service_id, uint64_t secret_id,
-			  CryptoKey& secret) const override;
+			  ExpiringCryptoKey& secret) const override;
   KeyRing *get_keyring();
 };
 

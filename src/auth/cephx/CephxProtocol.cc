@@ -413,6 +413,7 @@ bool cephx_decode_ticket(CephContext *cct, KeyStore *keys,
 {
   uint64_t secret_id = ticket_blob.secret_id;
   CryptoKey service_secret;
+  ExpiringCryptoKey rotating_secret;
 
   if (!ticket_blob.blob.length()) {
     return false;
@@ -425,11 +426,12 @@ bool cephx_decode_ticket(CephContext *cct, KeyStore *keys,
       return false;
     }
   } else {
-    if (!keys->get_service_secret(service_id, secret_id, service_secret)) {
+    if (!keys->get_service_secret(service_id, secret_id, rotating_secret)) {
       ldout(cct, 0) << "ceph_decode_ticket could not get service secret for service_id=" 
 	      << ceph_entity_type_name(service_id) << " secret_id=" << secret_id << dendl;
       return false;
     }
+    service_secret = rotating_secret.key;
   }
 
   std::string error;
@@ -477,6 +479,7 @@ bool cephx_verify_authorizer(CephContext *cct, const KeyStore& keys,
 	   << ceph_entity_type_name(service_id)
 	   << " secret_id=" << ticket.secret_id << dendl;
 
+  ExpiringCryptoKey sealing_secret;
   if (ticket.secret_id == (uint64_t)-1) {
     EntityName name;
     name.set_type(service_id);
@@ -488,13 +491,15 @@ bool cephx_verify_authorizer(CephContext *cct, const KeyStore& keys,
     }
   } else {
     ldout(cct, 20) << __func__ << ": looking up service secret for " << ceph_entity_type_name(service_id) << dendl;
-    if (!keys.get_service_secret(service_id, ticket.secret_id, service_secret)) {
+    if (!keys.get_service_secret(service_id, ticket.secret_id,
+                                 sealing_secret)) {
       ldout(cct, 0) << "verify_authorizer could not get service secret for service "
 	      << ceph_entity_type_name(service_id) << " secret_id=" << ticket.secret_id << dendl;
       if (cct->_conf->auth_debug && ticket.secret_id == 0)
 	ceph_abort_msg("got secret_id=0");
       return false;
     }
+    service_secret = sealing_secret.key;
   }
   ldout(cct, 30) << __func__ << ": got secret " << service_secret << dendl;
 
@@ -512,6 +517,56 @@ bool cephx_verify_authorizer(CephContext *cct, const KeyStore& keys,
     ldout(cct, 0) << __func__ << ": global_id mismatch: declared id=" << global_id
 	    << " ticket_id=" << ticket_info.ticket.global_id << dendl;
     return false;
+  }
+
+  // AuthTicket::encode writes a constant uid; a different one means tampering.
+  if (ticket_info.ticket.auid != CEPH_AUTH_UID_DEFAULT) {
+    ldout(cct, 0) << "verify_authorizer bad auid in ticket for "
+                  << ticket_info.ticket.name << ", rejecting" << dendl;
+    return false;
+  }
+
+  // the monitor never sets allow_all in a service ticket.
+  if (ticket_info.ticket.caps.allow_all) {
+    ldout(cct, 0) << "verify_authorizer allow_all set in ticket for "
+                  << ticket_info.ticket.name << ", rejecting" << dendl;
+    return false;
+  }
+
+  // Minted nsec is at most 1e9. The session key is created in the ticket's first
+  // five minutes; rotating-ticket lifetime cannot exceed its sealing-key span.
+  const utime_t created = ticket_info.ticket.created;
+  const utime_t expires = ticket_info.ticket.expires;
+  const utime_t session_created = ticket_info.session_key.get_created();
+  if (static_cast<uint32_t>(created.nsec()) > 1000000000u ||
+      static_cast<uint32_t>(expires.nsec()) > 1000000000u ||
+      session_created < created || session_created > expires ||
+      session_created - created > utime_t(300, 0) ||
+      (ticket.secret_id != (uint64_t)-1 &&
+       expires - created > sealing_secret.expiration -
+                               sealing_secret.key.get_created())) {
+    ldout(cct, 0) << "verify_authorizer bad ticket timestamps for "
+                  << ticket_info.ticket.name << ", rejecting" << dendl;
+    return false;
+  }
+
+  // Non-empty caps.caps must contain exactly one encoded string.
+  if (ticket_info.ticket.caps.caps.length()) {
+    auto p = ticket_info.ticket.caps.caps.cbegin();
+    std::string str;
+    try {
+      decode(str, p);
+    } catch (const ceph::buffer::error&) {
+      ldout(cct, 0) << "verify_authorizer undecodable caps in ticket for "
+                    << ticket_info.ticket.name << ", rejecting" << dendl;
+      return false;
+    }
+    if (!p.end()) {
+      ldout(cct, 0)
+          << "verify_authorizer trailing bytes after caps in ticket for "
+          << ticket_info.ticket.name << ", rejecting" << dendl;
+      return false;
+    }
   }
 
   ldout(cct, 10) << __func__ << ": global_id=" << global_id << dendl;

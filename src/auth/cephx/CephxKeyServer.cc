@@ -141,7 +141,8 @@ bool KeyServerData::get_service_secret(CephContext *cct, uint32_t service_id,
 }
 
 bool KeyServerData::get_service_secret(CephContext *cct, uint32_t service_id,
-				uint64_t secret_id, CryptoKey& secret) const
+				uint64_t secret_id,
+				ExpiringCryptoKey& secret) const
 {
   auto iter = rotating_secrets.find(service_id);
   if (iter == rotating_secrets.end()) {
@@ -164,7 +165,7 @@ bool KeyServerData::get_service_secret(CephContext *cct, uint32_t service_id,
     return false;
   }
 
-  secret = riter->second.key;
+  secret = riter->second;
 
   return true;
 }
@@ -365,7 +366,7 @@ bool KeyServer::get_service_secret(uint32_t service_id, CryptoKey& secret,
 }
 
 bool KeyServer::get_service_secret(uint32_t service_id,
-		uint64_t secret_id, CryptoKey& secret) const
+		uint64_t secret_id, ExpiringCryptoKey& secret) const
 {
   std::scoped_lock l{lock};
 

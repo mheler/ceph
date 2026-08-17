@@ -88,7 +88,7 @@ struct KeyServerData {
 			  CryptoKey& secret, uint64_t& secret_id,
 			  double& ttl) const;
   bool get_service_secret(CephContext *cct, uint32_t service_id,
-			  uint64_t secret_id, CryptoKey& secret) const;
+			  uint64_t secret_id, ExpiringCryptoKey& secret) const;
   bool get_auth(CephContext *cct, const EntityName& name, EntityAuth& auth) const;
   bool get_secret(CephContext *cct, const EntityName& name, CryptoKey& secret) const;
   bool get_caps(CephContext *cct, const EntityName& name,
@@ -219,7 +219,7 @@ public:
   bool get_service_secret(uint32_t service_id, CryptoKey& secret,
 			  uint64_t& secret_id, double& ttl) const;
   bool get_service_secret(uint32_t service_id, uint64_t secret_id,
-			  CryptoKey& secret) const override;
+			  ExpiringCryptoKey& secret) const override;
 
   void encode(ceph::buffer::list& bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);

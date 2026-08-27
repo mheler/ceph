@@ -182,7 +182,7 @@ int NVMeofGwMonitorClient::init()
   monc.set_passthrough_monmap();
 
   client_t whoami = monc.get_global_id();
-  client_messenger->set_myname(entity_name_t::MGR(whoami.v));
+  client_messenger->set_myname(entity_name_t::CLIENT(whoami.v));
   objecter.set_client_incarnation(0);
   objecter.init();
   objecter.enable_blocklist_events();

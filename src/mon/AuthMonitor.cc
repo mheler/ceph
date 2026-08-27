@@ -958,11 +958,14 @@ bool AuthMonitor::prep_auth(MonOpRequestRef op, bool paxos_writable)
       wait_for_active(op, new C_RetryMessage(this,op));
       goto done;
     }
-    if (ret > 0) {
-      if (!s->authenticated &&
-	  mon.ms_handle_fast_authentication(s->con.get()) > 0) {
-	finished = true;
+    if (ret > 0 && !s->authenticated) {
+      s->con->peer_name = s->auth_handler->get_entity_name();
+      finished = mon.ms_handle_fast_authentication(s->con.get());
+      if (!finished) {
+	ret = -EACCES;
       }
+    }
+    if (ret > 0) {
       ret = 0;
     }
   } catch (const ceph::buffer::error &err) {

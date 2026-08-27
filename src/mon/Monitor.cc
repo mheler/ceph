@@ -6885,6 +6885,7 @@ int Monitor::handle_auth_request(
   }
   if (r > 0 &&
       !s->authenticated) {
+    con->peer_name = s->auth_handler->get_entity_name();
     if (!ms_handle_fast_authentication(con)) {
       return -EACCES;
     }
@@ -6927,7 +6928,16 @@ void Monitor::ms_handle_accept(Connection *con)
 
 bool Monitor::ms_handle_fast_authentication(Connection *con)
 {
-  if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
+  if (!con->peer_is_client() &&
+      con->get_peer_type() != con->peer_name.get_type()) {
+    dout(1) << __func__ << " peer type " << con->get_peer_type()
+	    << " (" << ceph_entity_type_name(con->get_peer_type()) << ")"
+	    << " does not match authenticated entity "
+	    << con->peer_name << dendl;
+    return false;
+  }
+
+  if (con->peer_is_mon()) {
     // mon <-> mon connections need no Session, and setting one up
     // creates an awkward ref cycle between Session and Connection.
     return true;

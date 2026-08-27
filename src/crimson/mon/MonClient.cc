@@ -675,6 +675,14 @@ int Client::handle_auth_request(crimson::net::Connection &conn,
     &auth_meta.connection_secret,
     authorizer_challenge);
   if (is_valid) {
+    const int peer_type = conn.get_peer_type();
+    if (!conn.peer_is_client() && peer_type != name.get_type()) {
+      logger().error(
+        "peer type {} ({}) does not match authenticated entity {}",
+        peer_type, ceph_entity_type_name(peer_type), name);
+      return handle_auth_failure();
+    }
+
     auth_handler.handle_authentication(name, caps_info);
     return 1;
   }

@@ -30,6 +30,7 @@
 #include "common/Timer.h"
 #include "common/errno.h"
 #include "mon/MonClient.h"
+#include "mon/MonOpRequest.h"
 #include "msg/Dispatcher.h"
 #include "include/err.h"
 #include <boost/scoped_ptr.hpp>
@@ -64,6 +65,7 @@ class MonClientHelper : public Dispatcher
 {
 protected:
   CephContext *cct;
+  entity_type_t messenger_type;
   ceph::async::io_context_pool poolctx;
   Messenger *msg;
   MonClient monc;
@@ -77,9 +79,12 @@ protected:
 
 public:
 
-  explicit MonClientHelper(CephContext *cct_)
+  explicit MonClientHelper(
+    CephContext *cct_,
+    entity_type_t messenger_type_ = CEPH_ENTITY_TYPE_CLIENT)
     : Dispatcher(cct_),
       cct(cct_),
+      messenger_type(messenger_type_),
       poolctx(1),
       msg(NULL),
       monc(cct_, poolctx)
@@ -104,7 +109,8 @@ public:
     dout(1) << __func__ << dendl;
 
     std::string public_msgr_type = cct->_conf->ms_public_type.empty() ? cct->_conf.get_val<std::string>("ms_type") : cct->_conf->ms_public_type;
-    msg = Messenger::create(cct, public_msgr_type, entity_name_t::CLIENT(-1),
+    msg = Messenger::create(cct, public_msgr_type,
+                            entity_name_t(messenger_type, -1),
                             "test-mon-msg", 0);
     ceph_assert(msg != NULL);
     msg->set_default_policy(Messenger::Policy::lossy_client(0));
@@ -114,7 +120,7 @@ public:
     return 0;
   }
 
-  int init_monc() {
+  int init_monc(double timeout = 0.0) {
     dout(1) << __func__ << dendl;
     ceph_assert(msg != NULL);
     int err = monc.build_initial_monmap();
@@ -135,7 +141,7 @@ public:
       goto fail;
     }
 
-    err = monc.authenticate();
+    err = monc.authenticate(timeout);
     if (err < 0) {
       derr << __func__ << " monc auth failed: "
            << cpp_strerror(err) << dendl;
@@ -174,11 +180,11 @@ fail:
     return &monc.monmap;
   }
 
-  int init() {
+  int init(double timeout = 0.0) {
     int err = init_messenger();
     if (err < 0)
       goto fail;
-    err = init_monc();
+    err = init_monc(timeout);
     if (err < 0)
       goto fail_msgr;
     err = post_init();
@@ -330,6 +336,22 @@ TEST_F(MonMsgTest, MRouteTest)
   ASSERT_EQ(PTR_ERR(r), -ETIMEDOUT);
 }
 
+TEST_F(MonMsgTest, CombinedEntityTypeIsNotMonSource)
+{
+  OpTracker tracker(g_ceph_context, false, 1);
+  auto con = msg->get_loopback_connection();
+  const int saved_peer_type = con->get_peer_type();
+  con->set_peer_type(CEPH_ENTITY_TYPE_MON | CEPH_ENTITY_TYPE_MDS);
+
+  auto message = ceph::make_message<MGenericMessage>(CEPH_MSG_SHUTDOWN);
+  message->set_connection(con);
+  auto op = tracker.create_request<MonOpRequest>(message.detach());
+  const bool is_src_mon = op->is_src_mon();
+
+  con->set_peer_type(saved_peer_type);
+  EXPECT_FALSE(is_src_mon);
+}
+
 /* MMonScrub and MMonSync have other safeguards in place that prevent
  * us from actually receiving a reply even if the message is handled
  * by the monitor due to lack of cap checking.
@@ -351,22 +373,33 @@ protected:
   MonClientHelper* helper2 = nullptr;
   std::string entity;
 
-  void setup_low_priv_client(const std::string& ent, const std::string& caps) {
-    entity = ent;
+  int try_setup_low_priv_principal(
+    const std::string& ent,
+    const std::string& caps,
+    entity_type_t messenger_type = CEPH_ENTITY_TYPE_CLIENT,
+    double timeout = 0.0,
+    entity_type_t principal_type = CEPH_ENTITY_TYPE_CLIENT) {
+    entity = std::string(ceph_entity_type_name(principal_type)) + "." + ent;
     std::vector<std::string> cmd = {
-      "{\"prefix\": \"auth get-or-create-key\", \"entity\": \"client." + entity + "\", \"caps\": " + caps + "}"
+      "{\"prefix\": \"auth get-or-create-key\", \"entity\": \"" + entity +
+      "\", \"caps\": " + caps + "}"
     };
     bufferlist inbl, outbl;
     string outs;
     C_SaferCond cond_cmd;
     monc.start_mon_command(std::move(cmd), std::move(inbl), &outbl, &outs, &cond_cmd);
-    ASSERT_EQ(0, cond_cmd.wait());
+    int r = cond_cmd.wait();
+    if (r < 0) {
+      ADD_FAILURE() << "failed to provision " << entity << ": "
+                    << cpp_strerror(r);
+      return r;
+    }
 
     string key_str = outbl.to_str();
     key_str.erase(key_str.find_last_not_of(" \n\r\t") + 1);
 
-    CephInitParameters iparams(CEPH_ENTITY_TYPE_CLIENT);
-    iparams.name.set(CEPH_ENTITY_TYPE_CLIENT, entity.c_str());
+    CephInitParameters iparams(principal_type);
+    iparams.name.set(principal_type, ent.c_str());
     cct2 = boost::intrusive_ptr<CephContext>{common_preinit(iparams, CODE_ENVIRONMENT_LIBRARY, 0), false};
     cct2->_conf.set_val("key", key_str);
     cct2->_conf.set_val("debug_ms", "1");
@@ -381,8 +414,25 @@ protected:
     cct2->_log->start();
     common_init_finish(cct2.get());
 
-    helper2 = new MonClientHelper(cct2.get());
-    ASSERT_EQ(0, helper2->init());
+    helper2 = new MonClientHelper(cct2.get(), messenger_type);
+    r = helper2->init(timeout);
+    if (r < 0) {
+      delete helper2;
+      helper2 = nullptr;
+    }
+    return r;
+  }
+
+  void setup_low_priv_client(const std::string& ent, const std::string& caps) {
+    ASSERT_EQ(0, try_setup_low_priv_principal(ent, caps));
+  }
+
+  void expect_spoofed_type_rejected(
+    const std::string& ent, entity_type_t messenger_type) {
+    int r = try_setup_low_priv_principal(
+      ent, "[\"mon\", \"allow r\"]", messenger_type, 5.0);
+    EXPECT_TRUE(r == -EACCES || r == -ETIMEDOUT)
+      << "unexpected authentication result " << r << " for " << entity;
   }
 
   void teardown_low_priv_client() {
@@ -393,7 +443,7 @@ protected:
     }
     if (!entity.empty()) {
       std::vector<std::string> cmd = {
-        "{\"prefix\": \"auth rm\", \"entity\": \"client." + entity + "\"}"
+        "{\"prefix\": \"auth rm\", \"entity\": \"" + entity + "\"}"
       };
       bufferlist inbl, outbl;
       string outs;
@@ -412,6 +462,33 @@ protected:
     MonMsgTest::TearDown();
   }
 };
+
+TEST_F(MonAuthBypassTest, RejectsSpoofedMonMessengerType)
+{
+  expect_spoofed_type_rejected("test_mon_spoof", CEPH_ENTITY_TYPE_MON);
+}
+
+TEST_F(MonAuthBypassTest, RejectsCombinedMonMessengerType)
+{
+  expect_spoofed_type_rejected(
+    "test_mon_bit_spoof", CEPH_ENTITY_TYPE_MON | CEPH_ENTITY_TYPE_MDS);
+}
+
+TEST_F(MonAuthBypassTest, ClientMessengerMDSPrincipalIsNotMonSource)
+{
+  ASSERT_EQ(0, try_setup_low_priv_principal(
+    "test_client_messenger", "[\"mon\", \"allow r\"]",
+    CEPH_ENTITY_TYPE_CLIENT, 5.0, CEPH_ENTITY_TYPE_MDS));
+  Message *reply = helper2->send_wait_reply(
+    new MMonProbe(helper2->get_monmap()->fsid,
+                  MMonProbe::OP_PROBE, "b", false, ceph_release()),
+    MSG_MON_PROBE, 5.0);
+  if (!IS_ERR(reply)) {
+    reply->put();
+    FAIL() << "client messenger received a monitor-only probe reply";
+  }
+  ASSERT_EQ(PTR_ERR(reply), -ETIMEDOUT);
+}
 
 TEST_F(MonAuthBypassTest, MMonSubscribeKV_AuthBypass)
 {
@@ -603,4 +680,3 @@ int main(int argc, char *argv[])
 
   return RUN_ALL_TESTS();
 }
-

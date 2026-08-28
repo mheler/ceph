@@ -6930,11 +6930,16 @@ bool Monitor::ms_handle_fast_authentication(Connection *con)
 {
   if (!con->peer_is_client() &&
       con->get_peer_type() != con->peer_name.get_type()) {
-    dout(1) << __func__ << " peer type " << con->get_peer_type()
-	    << " (" << ceph_entity_type_name(con->get_peer_type()) << ")"
-	    << " does not match authenticated entity "
-	    << con->peer_name << dendl;
-    return false;
+    if (is_legacy_nvmeof_peer_type(con->get_peer_type(), con->peer_name)) {
+      dout(1) << __func__ << " allowing legacy NVMe-oF peer type for "
+	      << con->peer_name << dendl;
+    } else {
+      dout(1) << __func__ << " peer type " << con->get_peer_type()
+	      << " (" << ceph_entity_type_name(con->get_peer_type()) << ")"
+	      << " does not match authenticated entity "
+	      << con->peer_name << dendl;
+      return false;
+    }
   }
 
   if (con->peer_is_mon()) {

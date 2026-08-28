@@ -43,6 +43,16 @@ enum {
   AUTH_MODE_MON_MAX = 19,
 };
 
+// Some NVMe-oF monitor clients authenticate as client.nvmeof.* but advertise
+// MGR as their messenger peer type.  Accept only this exact tuple so they can
+// reconnect after peer type validation is enabled.
+inline bool is_legacy_nvmeof_peer_type(
+  entity_type_t peer_type, const EntityName& name)
+{
+  return peer_type == CEPH_ENTITY_TYPE_MGR &&
+    name.is_client() && name.get_id().starts_with("nvmeof.");
+}
+
 
 struct EntityAuth {
   CryptoKey key;

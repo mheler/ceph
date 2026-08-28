@@ -1850,12 +1850,17 @@ int MonClient::handle_auth_request(
   if (isvalid) {
     if (!con->peer_is_client() &&
 	con->get_peer_type() != con->peer_name.get_type()) {
-      ldout(cct, 1) << __func__ << " peer type "
-		    << con->get_peer_type() << " ("
-		    << ceph_entity_type_name(con->get_peer_type()) << ")"
-		    << " does not match authenticated entity "
-		    << con->peer_name << dendl;
-      return handle_auth_failure(cct);
+      if (is_legacy_nvmeof_peer_type(con->get_peer_type(), con->peer_name)) {
+	ldout(cct, 1) << __func__ << " allowing legacy NVMe-oF peer type for "
+		      << con->peer_name << dendl;
+      } else {
+	ldout(cct, 1) << __func__ << " peer type "
+		      << con->get_peer_type() << " ("
+		      << ceph_entity_type_name(con->get_peer_type()) << ")"
+		      << " does not match authenticated entity "
+		      << con->peer_name << dendl;
+	return handle_auth_failure(cct);
+      }
     }
 
     if (handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {

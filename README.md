@@ -154,6 +154,12 @@ path. Bazel downloads pinned TCMalloc sources and their build dependencies.
 OSD memory autotuning and heap stats/release commands support both allocators;
 gperftools profiler commands, release rates, and property writes remain legacy-only.
 
+Pass `-DGOOGLE_TCMALLOC=ON -DGOOGLE_TCMALLOC_THP=ON` to allow transparent
+huge pages (THP). `GOOGLE_TCMALLOC_THP` defaults to `OFF` and requires
+`GOOGLE_TCMALLOC=ON`. When enabled, Ceph skips `PR_SET_THP_DISABLE` at
+startup regardless of the runtime `thp` setting. The kernel's THP policy
+still controls whether huge pages can be used.
+
 #### Building without RADOS Gateway
 
 The RADOS Gateway is built by default. To build Ceph without the RADOS Gateway,

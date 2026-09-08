@@ -114,6 +114,7 @@
 /* Define if you have tcmalloc */
 #cmakedefine HAVE_LIBTCMALLOC
 #cmakedefine HAVE_GOOGLE_TCMALLOC
+#cmakedefine GOOGLE_TCMALLOC_THP
 #cmakedefine LIBTCMALLOC_MISSING_ALIGNED_ALLOC
 
 /* AsyncMessenger RDMA conditional compilation */

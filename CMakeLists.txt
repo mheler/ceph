@@ -465,6 +465,11 @@ set(ALLOCATOR "" CACHE STRING
 jemalloc, and libc is supported. if not specified, will try to find tcmalloc, \
 and then jemalloc. If neither of then is found. use the one in libc.")
 option(GOOGLE_TCMALLOC "Build Google's TCMalloc instead of gperftools" OFF)
+option(GOOGLE_TCMALLOC_THP
+  "Allow transparent huge pages with Google's TCMalloc" OFF)
+if(GOOGLE_TCMALLOC_THP AND NOT GOOGLE_TCMALLOC)
+  message(FATAL_ERROR "GOOGLE_TCMALLOC_THP requires GOOGLE_TCMALLOC=ON")
+endif()
 if(GOOGLE_TCMALLOC)
   if(ALLOCATOR AND NOT ALLOCATOR STREQUAL "tcmalloc")
     message(FATAL_ERROR "GOOGLE_TCMALLOC requires ALLOCATOR=tcmalloc")

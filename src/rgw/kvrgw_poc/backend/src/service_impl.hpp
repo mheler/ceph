@@ -545,7 +545,7 @@ class KvRgwServiceImpl final {
 
   NewVersionIds compute_new_version(VersioningState versioning_state, const ObjectValue* old_o);
 
-  void displace_old_object(
+  KvrgwErrorCode displace_old_object(
       KvTransaction& tr,
       VersioningState versioning_state,
       std::string_view object_key,

@@ -1545,37 +1545,40 @@ KvRgwServiceImpl::compute_new_version(VersioningState versioning_state,
   }
 }
 
-void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
-                                           VersioningState versioning_state,
-                                           std::string_view object_key,
-                                           const ObjectValue &old_o)
+KvrgwErrorCode
+KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
+                                      VersioningState versioning_state,
+                                      std::string_view object_key,
+                                      const ObjectValue &old_o)
 {
   if (versioning_state == VERSIONING_ENABLED) {
     const auto parts = parse_object_key(object_key);
     if (!parts) {
       move_object_to_g(tr, object_key, old_o);
-      return;
+      return KVRGW_ERR_OK;
     }
     const auto v_key =
         make_v_key(parts->bucket_id, parts->object_name, old_o.hdr.version_id);
     OValueBuf vbuf;
-    if (write_object_value(vbuf, old_o)) {
-      tr.kv_put(v_key.view(), vbuf.view());
+    if (!write_object_value(vbuf, old_o)) {
+      return KVRGW_ERR_VALUE_TOO_LARGE;
     }
+    tr.kv_put(v_key.view(), vbuf.view());
   }
   else if (versioning_state == VERSIONING_SUSPENDED) {
     const auto parts = parse_object_key(object_key);
     if (!parts) {
       move_object_to_g(tr, object_key, old_o);
-      return;
+      return KVRGW_ERR_OK;
     }
     if (old_o.hdr.version_id != kNullVersion) {
       const auto v_key = make_v_key(parts->bucket_id, parts->object_name,
                                     old_o.hdr.version_id);
       OValueBuf vbuf;
-      if (write_object_value(vbuf, old_o)) {
-        tr.kv_put(v_key.view(), vbuf.view());
+      if (!write_object_value(vbuf, old_o)) {
+        return KVRGW_ERR_VALUE_TOO_LARGE;
       }
+      tr.kv_put(v_key.view(), vbuf.view());
     }
     else {
       move_object_to_g(tr, object_key, old_o);
@@ -1630,6 +1633,7 @@ void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
   else {
     move_object_to_g(tr, object_key, old_o);
   }
+  return KVRGW_ERR_OK;
 }
 
 std::expected<KvRgwServiceImpl::DeleteContext, KvrgwErrorCode>
@@ -1746,14 +1750,21 @@ KvRgwServiceImpl::delete_apply(KvTransaction &tr, DeleteContext &ctx,
     if (!old_parsed) {
       return result;
     }
-    displace_old_object(tr, VERSIONING_DISABLED, ctx.object_key, *old_parsed);
+    if (auto ec = displace_old_object(tr, VERSIONING_DISABLED, ctx.object_key,
+                                      *old_parsed);
+        ec != KVRGW_ERR_OK) {
+      return std::unexpected(ec);
+    }
     return result;
 
   case VERSIONING_ENABLED:
   case VERSIONING_SUSPENDED: {
     if (old_parsed) {
-      displace_old_object(tr, bucket_state.versioning_state, ctx.object_key,
-                          *old_parsed);
+      if (auto ec = displace_old_object(tr, bucket_state.versioning_state,
+                                        ctx.object_key, *old_parsed);
+          ec != KVRGW_ERR_OK) {
+        return std::unexpected(ec);
+      }
     }
     auto ids = compute_new_version(bucket_state.versioning_state,
                                    old_parsed ? &*old_parsed : nullptr);
@@ -2194,7 +2205,10 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
           return KVRGW_ERR_OK;
         }
         if (ev) {
-          displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+          if (auto ec = displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+              ec != KVRGW_ERR_OK) {
+            return ec;
+          }
         }
       }
     }
@@ -2208,7 +2222,10 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
           return KVRGW_ERR_OK;
         }
         if (ev) {
-          displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+          if (auto ec = displace_old_object(tr, vs, ctx.object_key.view(), *ev);
+              ec != KVRGW_ERR_OK) {
+            return ec;
+          }
         }
       }
     }
@@ -2290,7 +2307,11 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
   }
 
   if (old_parsed) {
-    displace_old_object(tr, vs, ctx.object_key.view(), *old_parsed);
+    if (auto ec =
+            displace_old_object(tr, vs, ctx.object_key.view(), *old_parsed);
+        ec != KVRGW_ERR_OK) {
+      return ec;
+    }
   }
 
   auto ids = compute_new_version(vs, old_parsed ? &*old_parsed : nullptr);
@@ -2909,9 +2930,10 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
         if (promoted) {
           promoted->hdr.next_vid = current->hdr.next_vid;
           OValueBuf pbuf;
-          if (write_object_value(pbuf, *promoted)) {
-            tr->kv_put(object_key.view(), pbuf.view());
+          if (!write_object_value(pbuf, *promoted)) {
+            return KVRGW_ERR_VALUE_TOO_LARGE;
           }
+          tr->kv_put(object_key.view(), pbuf.view());
           tr->kv_del(std::string_view(v_scan->front().key));
         }
       }
@@ -3733,9 +3755,10 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
       if (!src.has_shared_data()) {
         src.hdr.flags |= ObjectValue::kFlagSharedData;
         OValueBuf src_buf;
-        if (write_object_value(src_buf, src)) {
-          tr->kv_put(src_entry_key, src_buf.view());
+        if (!write_object_value(src_buf, src)) {
+          return KVRGW_ERR_VALUE_TOO_LARGE;
         }
+        tr->kv_put(src_entry_key, src_buf.view());
       }
 
       new_value.hdr.chunk.type = CHUNK_CHILD_D_REF;
@@ -3784,9 +3807,10 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
 
         src.hdr.flags |= ObjectValue::kFlagSharedData;
         OValueBuf src_buf;
-        if (write_object_value(src_buf, src)) {
-          tr->kv_put(src_entry_key, src_buf.view());
+        if (!write_object_value(src_buf, src)) {
+          return KVRGW_ERR_VALUE_TOO_LARGE;
         }
+        tr->kv_put(src_entry_key, src_buf.view());
       }
 
       new_value.hdr.chunk.type = CHUNK_STORAGE_REF;
@@ -3832,8 +3856,11 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
 
     // --- Displace destination + versioning ---
     if (dst_parsed) {
-      displace_old_object(*tr, vb->versioning_state, dst_o_key.view(),
-                          *dst_parsed);
+      if (auto ec = displace_old_object(*tr, vb->versioning_state,
+                                        dst_o_key.view(), *dst_parsed);
+          ec != KVRGW_ERR_OK) {
+        return ec;
+      }
     }
     auto ids = compute_new_version(vb->versioning_state,
                                    dst_parsed ? &*dst_parsed : nullptr);

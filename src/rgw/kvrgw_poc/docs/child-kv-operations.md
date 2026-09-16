@@ -351,44 +351,45 @@ Always writes O: (clears tag fields) → write-write conflict on both FDB and Ti
 
 Extended value holds metadata overflow — internal data that logically belongs to the object but exceeds the O: value size (e.g., large manifests, compression dictionaries, encryption metadata for multipart objects). Extended value is NOT user-addressable — clients never read/write it directly. It is accessed internally as part of GET/PUT operations.
 
-**Three-level storage (similar to annotations, but no standalone KV when on data tier):**
+The internal attributes are encoded as one attr frame (`u16 count`, then `u16 key_len`, key, `u32 val_len`, value per entry; keys sorted and unique). The frame has two placements, chosen at write time:
 
-| Metadata size | Storage | Pointer in O: | C:E entry? |
-|---|---|---|---|
-| Fits in O: value | Inline in O: | N/A (data is there) | No |
-| Overflows O: but < KV value limit | C:<ref_tag>E (single entry) | `{ev_location: CHILD_E}` | Yes |
-| Exceeds KV value limit (extreme multipart) | Data tier blob | `{ev_location: STORAGE, storage_id, blob_id, offset, length}` | No |
+| Metadata size | Storage | O: flag |
+|---|---|---|
+| Whole O: record fits in 1 KB with the frame appended | Inline in O:, after the metadata frame | `kFlagInlineAttrs` |
+| Anything larger | Chunked child keys `C:<ref_tag>E<index>` | `kFlagExtendedAttrs` |
 
-Unlike annotations, extended value on the storage tier does NOT need a C:E entry — O: holds the storage pointer directly. Extended value is not user-addressable, so there's nothing for a client to look up by name.
+The frame is never split between the two: it is either entirely inline or entirely in child keys.
+
+**Chunk layout.** `index` is a big-endian `u16` counting up from 0. Each value is a `ChildValueHeader` (8 B) followed by at most 8192 B of payload, so every value stays under FDB's 10 KB performance guidance. The payload of chunk 0 starts with a format byte (`1`) and the `u32` frame length; the rest of the payload, and all later chunks, are frame bytes. The frame is capped at 8 MiB (about 1,025 chunks), which covers a 10,000-part compressed and encrypted object (about 1.3 MB) several times over. Larger frames are rejected with `VALUE_TOO_LARGE`.
+
+There is no storage-tier placement. Keeping the frame in the KV store means it commits atomically with the O: record, reads back with one range scan, and needs no second cleanup path on the data tier.
 
 **Write (during PUT Phase 3):**
 
-Extended values are written atomically in the same transaction as the parent O: entry:
+The chunks are written in the same transaction as the parent O: entry:
 
 ```
 txn {
   ... (PUT Phase 3 steps) ...
   get(P:O) → if null → abort
-  put(O:, value_with_ev_location_flag)
-  put(C:<ref_tag>E, overflow_metadata)  // only if ev_location = CHILD_E
+  put(C:<ref_tag>E<0>, header + frame[0:8187])   // only when extended
+  put(C:<ref_tag>E<1>, frame[8187:16379])
+  ...
+  put(O:, value_with_placement_flag)
   delete(P:O)
   commit
 }
 ```
 
-For storage-tier extended value: written in PUT Phase 2 alongside object data (same blob or adjacent blob, same P:O coordination). O: stores the pointer directly — no C:E entry created.
+No separate P: coordination is needed: if the transaction does not commit, no chunk exists. CopyObject reads the source frame (inline or chunked) and places it again under the destination ref_tag in its own transaction.
 
-No separate P: coordination needed for C:E — piggybacks on the parent's P:O.
+CompleteMultipartUpload (not implemented yet) will be the one writer whose frame can exceed the 1 MB transaction advisory. The plan is to write the chunks in phase 2 (lock-free) in batches of about 64 chunks per transaction under the upload's ref_tag, then commit only the O: entry in phase 3. Until phase 3 commits nothing references the chunks, so the P:M DEEP sweeper must clear `C:<ref_tag>` along with the parts if the completion is abandoned.
 
-**Read (on first access):**
+**Read:**
 
-When GET encounters extended value:
-- `CHILD_E`: follow-up read `get(C:<ref_tag>E)`. Single KV read, typically cached after first access.
-- `STORAGE`: fetch from data tier (same as reading object data — one storage-tier read).
+`RangeScan(C:<ref_tag>E)` in the same transaction as the O: read. The reader requires contiguous indexes from 0 and a reassembled length equal to the header's frame length; anything else is treated as a torn value. GET and byte-range GET load the frame; HEAD and listing never do.
 
-**Lifecycle:** Owned entirely by the parent. When the parent moves to G: (deletion/overwrite):
-- `CHILD_E`: GC deletes C:E via `RangeScan(C:<ref_tag>*)`.
-- `STORAGE`: GC frees the storage blob (same mechanism as freeing object data — may be the same blob).
+**Lifecycle:** Owned entirely by the parent. The chunks live under the `C:<ref_tag>` prefix, so the existing `RangeDelete(C:<ref_tag>*)` on delete, overwrite and in the GC worker removes them. Nothing extra is needed.
 
 ---
 

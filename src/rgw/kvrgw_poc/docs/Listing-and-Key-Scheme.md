@@ -226,7 +226,7 @@ All keys are binary byte strings with no delimiters between fields. Fixed-length
 | ref_tag | 12 B | binary | `rgw_id (4B, uint32 BE) + seq_id (8B, uint64 BE)` — unique write instance identifier |
 | child_type | 1 B | ASCII | `A` (annotation), `T` (tags), `E` (extended value) |
 | part_number | 2 B | uint16 big-endian | Multipart part number; 0 = upload metadata, 1–10000 = parts |
-| child_id | 0–512 B | raw bytes (UTF-8) | Annotation name for type `A`; empty for `T`, `E` |
+| child_id | 0–512 B | raw bytes (UTF-8) | Annotation name for type `A`; empty for `T`; uint16 big-endian chunk index for `E` |
 
 ### Fixed Header
 
@@ -675,13 +675,15 @@ Tied to a specific object version. Independent across versions. Deletion is perm
 
 ### Extended value (`:C:`)
 
-**Key:** `<namespace><shard_count><shard_id><bucket_id>C<ref_tag>E`
+**Key:** `<namespace><shard_count><shard_id><bucket_id>C<ref_tag>E<chunk_index>`
+
+`chunk_index` is a uint16 big-endian counting up from 0. One key per 8 KiB of the attr frame; the frame is capped at 8 MiB.
 
 | Operation | Trigger | Key construction |
 |---|---|---|
-| Write extended value | PUT of large object | ref_tag known at write time — direct |
-| Read extended value | GET / byte-range of large object | Parent read → ref_tag → point read |
-| Delete extended value | Object DELETE or overwrite | Parent read → ref_tag → delete |
+| Write extended value | PUT / CopyObject / CompleteMultipartUpload of a large object | ref_tag known at write time — one put per chunk |
+| Read extended value | GET / byte-range of large object | Parent read → ref_tag → `RangeScan(...C<ref_tag>E)` |
+| Delete extended value | Object DELETE or overwrite | Covered by `RangeDelete(...C<ref_tag>)` |
 
 ### Child cleanup on parent deletion
 

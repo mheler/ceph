@@ -19,15 +19,9 @@ HEAD requests and listing are served entirely from this tier.
 
 - **Tier 2 — Extended value.**\
 When read-path metadata overflows the KV entry (large compressed multipart objects), it is stored in an extended value.\
-The KV entry contains routing info pointing to the extended value's location.
+The KV entry carries a flag saying the extended value exists.
 
-The extended value is a logical concept — its physical storage is pluggable:
-- Data header prepended to the first data chunk.
-- Standalone metadata file alongside the data.
-- Object annotation (sidecar metadata).
-- Additional KV entries under a related key.
-
-The choice depends on the storage backend. RGW must not assume a specific storage mechanism.
+The extended value is the same attr frame, split into chunked child keys `C:<ref_tag>E<index>` of at most 8 KiB each and reassembled with one range scan. It is written in the same transaction as the KV entry and cleaned up by the same child-key prefix clear. See [child-kv-operations.md — Extended Value Operations](child-kv-operations.md#extended-value-operations).
 
 For the vast majority of objects (single-part, small multipart, uncompressed multipart), the KV entry is the sole metadata store. Only very large compressed multipart objects require the extended value for byte-range resolution.
 
@@ -263,10 +257,8 @@ The KV store is purpose-built for small KV access, operates on SSD/NVMe, and its
    - No extended value access needed.
 
 5. **KV value does not contain read-path metadata (large compressed multipart):**
-   - Read the extended value from its storage location.
-     For full-object reads from offset 0, the extended value may be included
-     in the first data chunk at no extra cost (when stored as a data header).
-   - Verify ref_tag from the extended value against the KV value.
+   - Range-scan the `C:<ref_tag>E` chunks in the same transaction as the
+     KV read and reassemble the attr frame.
    - Use the full manifest to read and reassemble data chunks.
 
 6. Decompress/decrypt and stream to client.
@@ -798,15 +790,16 @@ The head deletion fences the upload — subsequent UploadPart Phase 1 transactio
 
 2. `RangeScan(M:<object_name><ref_tag>)` — read all part entries. Safe because the fence prevents new Phase 1 transactions. In-flight UploadPart Phase 3 blind writes may still create or update `:M:` entries — but only for parts whose Phase 1 committed before the fence. The scan only considers entries with `state=committed`.
 3. Validate against the client-supplied part list: all specified parts exist, etags match.
-4. Assemble the final manifest from chunk pointers of all parts. Compute the composite etag, total size, and all requested attributes.
+4. Assemble the final manifest from chunk pointers of all parts. Merge the parts' compression block tables with rebased offsets (mixed compression types are an error, as in RGW today) and collect per-part encryption salts. Compute the composite etag, total size, and all requested attributes.
+5. Encode the manifest, compression table and encryption metadata as the attr frame. If it does not fit inline, write it as `C:<ref_tag>E<index>` chunks under the upload's `ref_tag`, in batches small enough to stay under the 1 MB transaction advisory (about 64 chunks each). Nothing references the chunks until Phase 3 commits. The chunk format is implemented; this multipart writer is not. See [child-kv-operations.md — Extended Value Operations](child-kv-operations.md#extended-value-operations).
 
 **Phase 3 — commit final object (single-shard transaction):**
 
-5. In a single transaction:
+6. In a single transaction:
    - `get(P:M)` — if null → abort (DeleteBucket or sweeper force-aborted the upload).
    - `get(B)` — if null → abort (bucket deleted). On FDB, `get(B)` creates a read conflict range that detects concurrent DeleteBucket. On TiKV, same best-effort guarantee as PUT Phase 3.
    - If the object key already exists as a live object → move old `:O:` entry to the `G` (GC) namespace with a stripped value. See [GC Namespace](#gc-namespace-and-background-cleanup).
-   - Write the final object KV entry (`:O:`) with the assembled manifest.
+   - Write the final object KV entry (`:O:`) with the inline attr frame, or with `kFlagExtendedAttrs` pointing at the chunks written in Phase 2.
    - Write a `G:M` directive with the client's part list and `ref_tag`. The background worker uses these to:
      - Parts in the client list → delete `:M:` KV only (data owned by the final object).
      - Parts NOT in the client list (unused, pending, or orphaned) → delete `:M:` KV + free storage-tier data.
@@ -1475,15 +1468,7 @@ For single-part objects and small multipart objects, read-path metadata fits com
 
 ### How the extended value is accessed
 
-The KV entry always contains routing info pointing to the extended value's location. The retrieval method depends on the storage backend:
-
-- **Data header** — prepended to the first data chunk. For full-object GETs from offset 0, it is read as part of the first chunk at no extra cost. For byte-range reads, it requires a separate read of the first chunk's header.
-
-- **Standalone file** — a separate metadata file alongside the data. Always requires a separate read. Natural fit for POSIX backends that cannot prepend headers to existing files.
-
-- **Object annotation** — sidecar metadata attached to the data object by the storage tier. Retrieval depends on the storage API.
-
-- **Additional KV entries** — overflow stored in the same KV store under a related key (child KV with a distinguishing suffix). Retrieved via a standard KV read, co-located on the same shard.
+The KV entry carries `kFlagExtendedAttrs` when the extended value exists. The value itself is a run of child keys `C:<ref_tag>E<index>` on the same shard, at most 8 KiB of payload each, reassembled with one range scan in the same transaction as the KV entry read. Chunk 0 carries the frame length so a torn set is detected. See [child-kv-operations.md — Extended Value Operations](child-kv-operations.md#extended-value-operations) for the layout and the write protocol.
 
 ### Local caching
 

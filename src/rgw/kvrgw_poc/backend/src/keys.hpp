@@ -135,6 +135,8 @@ KeyBuf make_r_key(std::string_view ref_tag);
 
 KeyBuf make_ct_key(bucket_id_t bucket_id, std::string_view ref_tag);
 KeyBuf make_c_prefix(bucket_id_t bucket_id, std::string_view ref_tag);
+KeyBuf make_ce_prefix(bucket_id_t bucket_id, std::string_view ref_tag);
+KeyBuf make_ce_key(bucket_id_t bucket_id, std::string_view ref_tag, uint16_t index);
 
 struct GroupPoKeyParts {
   uint16_t shard_count{};

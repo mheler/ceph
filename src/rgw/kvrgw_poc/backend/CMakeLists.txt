@@ -50,6 +50,7 @@ set(KVRGW_LIB_SRCS
   src/id_tag.cpp
   src/id_meta.cpp
   src/attr_frame.cpp
+  src/extended_attrs.cpp
   src/service_impl.cpp
   src/bucket_policy.cpp
   src/sweeper.cpp
@@ -108,7 +109,7 @@ set_target_properties(kv-rgw-backend PROPERTIES
   INSTALL_RPATH "${FDB_LIB_DIR};$ORIGIN"
 )
 
-add_executable(object_value_test tests/object_value_test.cpp src/object_value.cpp src/tenant_value.cpp src/id_tag.cpp src/id_meta.cpp src/typed_ids.cpp)
+add_executable(object_value_test tests/object_value_test.cpp src/object_value.cpp src/tenant_value.cpp src/id_tag.cpp src/id_meta.cpp src/attr_frame.cpp src/typed_ids.cpp)
 target_include_directories(object_value_test PRIVATE
   "${CMAKE_SOURCE_DIR}/src"
 )
@@ -131,6 +132,7 @@ add_executable(kv_range_test
   src/object_value.cpp
   src/id_tag.cpp
   src/id_meta.cpp
+  src/attr_frame.cpp
   src/typed_ids.cpp
 )
 target_include_directories(kv_range_test PRIVATE
@@ -157,6 +159,7 @@ add_executable(gc_ctl
   src/object_value.cpp
   src/id_tag.cpp
   src/id_meta.cpp
+  src/attr_frame.cpp
   src/typed_ids.cpp
 )
 target_include_directories(gc_ctl PRIVATE
@@ -197,6 +200,18 @@ target_link_libraries(data_store_error_test PRIVATE OpenSSL::Crypto)
 add_executable(err_insertion_test tests/err_insertion_test.cpp src/err_insertion.cpp)
 target_include_directories(err_insertion_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
 
+add_executable(extended_attrs_test tests/extended_attrs_test.cpp)
+target_include_directories(extended_attrs_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/src"
+  "${FDB_INCLUDE_DIR}"
+  "${GENERATED_DIR}"
+)
+target_link_libraries(extended_attrs_test PRIVATE kvrgw)
+set_target_properties(extended_attrs_test PROPERTIES
+  BUILD_RPATH "${FDB_LIB_DIR};$ORIGIN"
+  INSTALL_RPATH "${FDB_LIB_DIR};$ORIGIN"
+)
+
 add_executable(kvrgw_c_abi_test tests/kvrgw_c_abi_test.c)
 target_include_directories(kvrgw_c_abi_test PRIVATE "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(kvrgw_c_abi_test PRIVATE kvrgw)
@@ -212,6 +227,7 @@ add_test(NAME attr_frame_test COMMAND attr_frame_test)
 add_test(NAME l_key_test COMMAND l_key_test)
 add_test(NAME data_store_test COMMAND data_store_test)
 add_test(NAME kv_range_test COMMAND kv_range_test)
+add_test(NAME extended_attrs_test COMMAND extended_attrs_test)
 add_test(NAME gc_config_state_test COMMAND gc_config_state_test)
 add_test(NAME fdb_error_test COMMAND fdb_error_test)
 add_test(NAME data_store_error_test COMMAND data_store_error_test)

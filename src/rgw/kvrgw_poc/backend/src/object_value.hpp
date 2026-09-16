@@ -150,18 +150,24 @@ struct ObjectValue {
   std::string content_type;
   std::vector<uint8_t> inline_data;
   std::vector<uint8_t> metadata_frame;
+  // Internal attrs (attr_frame.hpp). Follows the metadata frame in the
+  // record when kFlagInlineAttrs is set; lives in C:<ref_tag>E child
+  // keys when kFlagExtendedAttrs is set. Never both.
+  std::vector<uint8_t> attr_frame;
 
   static constexpr uint8_t kFlagExtendedAttrs        = 0x01;
   static constexpr uint8_t kFlagFenced               = 0x02;
   static constexpr uint8_t kFlagSharedData           = 0x04;
   static constexpr uint8_t kFlagExternalTags         = 0x08;
   static constexpr uint8_t kFlagExternalAnnotations  = 0x10;
+  static constexpr uint8_t kFlagInlineAttrs          = 0x20;
 
   // Flags that mean the object owns keys under C:<ref_tag>.
   static constexpr uint8_t kFlagChildKeys =
       kFlagExtendedAttrs | kFlagExternalTags | kFlagExternalAnnotations;
 
   bool has_extended_attrs() const { return (hdr.flags & kFlagExtendedAttrs) != 0; }
+  bool has_inline_attrs() const { return (hdr.flags & kFlagInlineAttrs) != 0; }
   bool has_child_keys() const { return (hdr.flags & kFlagChildKeys) != 0; }
   bool has_annotations() const { return hdr.annotations_count > 0; }
   bool has_external_annotations() const { return (hdr.flags & kFlagExternalAnnotations) && hdr.annotations_count > 0; }

@@ -67,6 +67,14 @@ inline constexpr size_t kMaxInlineTagPayload = 256;
 inline constexpr size_t kMaxOValueBytes = 1024;
 inline constexpr uint8_t kFlagExternalTags = 0x08;
 
+// Extended attrs: an attr frame that does not fit in the O: record is
+// split across C:<ref_tag>E<index> child keys. 8 KiB payloads keep each
+// value under FDB's 10 KB performance guidance; the frame cap keeps the
+// whole set well inside the 10 MB transaction limit.
+inline constexpr size_t kExtendedChunkBytes = 8192;
+inline constexpr size_t kMaxExtendedAttrBytes = 8 * 1024 * 1024;
+inline constexpr uint8_t kExtendedFormatV1 = 1;
+
 inline constexpr std::string_view kLocalCounterTenantId = "tenant_id";
 inline constexpr std::string_view kLocalCounterBucketId = "bucket_id";
 inline constexpr std::string_view kLocalCounterRgwId = "rgw_id";

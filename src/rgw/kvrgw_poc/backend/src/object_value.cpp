@@ -14,6 +14,7 @@
 
 #include "object_value.hpp"
 
+#include "attr_frame.hpp"
 #include "id_meta.hpp"
 
 #include <algorithm>
@@ -189,6 +190,21 @@ std::optional<ObjectValue> parse_object_value(std::string_view data)
       return std::nullopt;
     }
     value.metadata_frame.assign(rest.data(), rest.data() + frame_size);
+    tail_offset += frame_size;
+  }
+
+  if (value.has_inline_attrs()) {
+    if (value.has_extended_attrs()) {
+      return std::nullopt;
+    }
+    const std::span<const uint8_t> rest(
+        reinterpret_cast<const uint8_t *>(data.data() + tail_offset),
+        data.size() - tail_offset);
+    size_t frame_size = 0;
+    if (!encoded_attr_frame_size(rest, frame_size)) {
+      return std::nullopt;
+    }
+    value.attr_frame.assign(rest.data(), rest.data() + frame_size);
   }
 
   return value;
@@ -229,6 +245,14 @@ bool write_object_value(OValueBuf &buf, const ObjectValue &value)
       return false;
     }
     if (!buf.append(value.metadata_frame.data(), value.metadata_frame.size())) {
+      return false;
+    }
+  }
+  if (value.has_inline_attrs()) {
+    if (value.attr_frame.empty() || value.has_extended_attrs()) {
+      return false;
+    }
+    if (!buf.append(value.attr_frame.data(), value.attr_frame.size())) {
       return false;
     }
   }

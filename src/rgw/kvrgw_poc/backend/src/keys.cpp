@@ -497,6 +497,23 @@ KeyBuf make_c_prefix(bucket_id_t bucket_id, std::string_view ref_tag)
   return key;
 }
 
+KeyBuf make_ce_prefix(bucket_id_t bucket_id, std::string_view ref_tag)
+{
+  KeyBuf key = make_c_prefix(bucket_id, ref_tag);
+  const char child_type = kChildTypeExtended;
+  key.append(&child_type, 1);
+  return key;
+}
+
+KeyBuf make_ce_key(bucket_id_t bucket_id, std::string_view ref_tag,
+                   uint16_t index)
+{
+  KeyBuf key = make_ce_prefix(bucket_id, ref_tag);
+  const uint16_t index_be = htons(index);
+  key.append(&index_be, sizeof(index_be));
+  return key;
+}
+
 std::optional<GroupPoKeyParts> parse_group_po_key(std::string_view key)
 {
   constexpr size_t kGroupPoKeySize =

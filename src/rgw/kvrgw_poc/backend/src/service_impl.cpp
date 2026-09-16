@@ -19,6 +19,7 @@
 #include "byte_range.hpp"
 #include "constants.hpp"
 #include "error_codes.hpp"
+#include "extended_attrs.hpp"
 #include "gc_value.hpp"
 #include "keys.hpp"
 #include "object_value.hpp"
@@ -1368,19 +1369,19 @@ KvRgwServiceImpl::load_object(bucket_id_t bucket_id,
   return parse_object_value(**value);
 }
 
-std::expected<std::optional<KvRgwServiceImpl::LoadResult>, fdb_error_t>
+std::expected<std::optional<KvRgwServiceImpl::LoadResult>, KvrgwErrorCode>
 KvRgwServiceImpl::load_object_with_data(bucket_id_t bucket_id,
                                         const std::string &object_name)
 {
   auto tr_result = store_.begin_transaction();
   if (!tr_result) {
-    return std::unexpected(tr_result.error());
+    return std::unexpected(fdb_to_error(tr_result.error()));
   }
   auto &tr = *tr_result;
   const auto key = make_object_key(bucket_id, object_name);
   auto raw = tr->kv_get(key.view());
   if (!raw) {
-    return std::unexpected(raw.error());
+    return std::unexpected(fdb_to_error(raw.error()));
   }
   if (!*raw) {
     return std::nullopt;
@@ -1392,6 +1393,21 @@ KvRgwServiceImpl::load_object_with_data(bucket_id_t bucket_id,
 
   LoadResult result;
   result.value = std::move(*obj);
+
+  if (result.value.has_extended_attrs()) {
+    const std::string_view ref_sv(
+        reinterpret_cast<const char *>(result.value.hdr.ref_tag), kRefTagSize);
+    auto frame = read_extended_attrs(*tr, bucket_id, ref_sv);
+    if (!frame) {
+      return std::unexpected(fdb_to_error(frame.error()));
+    }
+    if (!*frame) {
+      // The chunks commit with the record, so a torn set is corruption,
+      // not a missing object.
+      return std::unexpected(KVRGW_ERR_CORRUPT_VALUE);
+    }
+    result.value.attr_frame = std::move(**frame);
+  }
 
   if (result.value.hdr.chunk.type == CHUNK_INLINE) {
     result.data.assign(result.value.inline_data.begin(),
@@ -1415,7 +1431,7 @@ KvRgwServiceImpl::load_object_with_data(bucket_id_t bucket_id,
     const auto d_key = make_d_key(d_bucket, st, ref_sv, mtime);
     auto d_val = tr->kv_get(d_key.view());
     if (!d_val) {
-      return std::unexpected(d_val.error());
+      return std::unexpected(fdb_to_error(d_val.error()));
     }
     if (!*d_val) {
       return std::nullopt;
@@ -2212,6 +2228,12 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
                           ref_tag_view(params.ref_tag));
     }
 
+    if (auto ec = place_attr_frame(params.value, tr, params.bucket_id,
+                                   ref_tag_view(params.ref_tag));
+        ec != KVRGW_ERR_OK) {
+      return ec;
+    }
+
     OValueBuf vbuf;
     if (!write_object_value(vbuf, params.value)) {
       return KVRGW_ERR_VALUE_TOO_LARGE;
@@ -2288,6 +2310,12 @@ KvRgwServiceImpl::put_finalize(KvTransaction &tr, PutContext &ctx,
   if (!params.tags.empty()) {
     apply_tags_to_value(params.value, params.tags, tr, params.bucket_id,
                         ref_tag_view(params.ref_tag));
+  }
+
+  if (auto ec = place_attr_frame(params.value, tr, params.bucket_id,
+                                 ref_tag_view(params.ref_tag));
+      ec != KVRGW_ERR_OK) {
+    return ec;
   }
 
   OValueBuf vbuf;
@@ -3594,6 +3622,16 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
               reinterpret_cast<const char *>(src.hdr.ref_tag), kRefTagSize);
           apply_tags_to_value(src, req.tags, *tr, dst_bucket_id, src_ref_sv);
         }
+        // Inline attrs are in memory and may no longer fit next to the
+        // new metadata. Extended attrs stay where they are.
+        if (src.has_inline_attrs()) {
+          const std::string_view attr_ref_sv(
+              reinterpret_cast<const char *>(src.hdr.ref_tag), kRefTagSize);
+          if (auto ec = place_attr_frame(src, *tr, dst_bucket_id, attr_ref_sv);
+              ec != KVRGW_ERR_OK) {
+            return ec;
+          }
+        }
         OValueBuf buf;
         if (!write_object_value(buf, src)) {
           return KVRGW_ERR_INTERNAL;
@@ -3644,6 +3682,27 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
     else {
       new_value.hdr.metadata_count = src.hdr.metadata_count;
       new_value.metadata_frame = src.metadata_frame;
+    }
+
+    // Internal attrs always travel with the copy.
+    new_value.attr_frame = src.attr_frame;
+    if (src.has_extended_attrs()) {
+      const std::string_view attr_ref_sv(
+          reinterpret_cast<const char *>(src.hdr.ref_tag), kRefTagSize);
+      auto frame = read_extended_attrs(*tr, src_bucket_id, attr_ref_sv);
+      if (!frame) {
+        auto ec = fdb_to_error(frame.error());
+        if (is_retriable(ec)) {
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(10 * (attempt + 1)));
+          continue;
+        }
+        return ec;
+      }
+      if (!*frame) {
+        return KVRGW_ERR_CORRUPT_VALUE;
+      }
+      new_value.attr_frame = std::move(**frame);
     }
 
     // --- Data sharing by tier ---
@@ -3810,6 +3869,15 @@ KvrgwErrorCode KvRgwServiceImpl::copy_object(const CopyObjectRequest &req,
     new_value.hdr.version_id = ids.version_id;
     new_value.hdr.next_vid = ids.next_vid;
 
+    {
+      const std::string_view dst_ref_sv(
+          reinterpret_cast<const char *>(new_value.hdr.ref_tag), kRefTagSize);
+      if (auto ec = place_attr_frame(new_value, *tr, dst_bucket_id, dst_ref_sv);
+          ec != KVRGW_ERR_OK) {
+        return ec;
+      }
+    }
+
     // --- Write destination O: ---
     OValueBuf dst_buf;
     if (!write_object_value(dst_buf, new_value)) {
@@ -3888,7 +3956,7 @@ KvrgwErrorCode KvRgwServiceImpl::load_object_for_read(
     if (load_kv_data) {
       auto current_res = load_object_with_data(bucket_id, object_name);
       if (!current_res) {
-        return fdb_to_error(current_res.error());
+        return current_res.error();
       }
       if (*current_res && (*current_res)->value.hdr.version_id == target_vid) {
         return accept(std::move((*current_res)->value),
@@ -3921,6 +3989,18 @@ KvrgwErrorCode KvRgwServiceImpl::load_object_for_read(
     auto v_obj = parse_object_value(**v_raw);
     if (!v_obj) {
       return KVRGW_ERR_CORRUPT_VALUE;
+    }
+    if (load_kv_data && v_obj->has_extended_attrs()) {
+      const std::string_view ref_sv(
+          reinterpret_cast<const char *>(v_obj->hdr.ref_tag), kRefTagSize);
+      auto frame = read_extended_attrs(*tr, bucket_id, ref_sv);
+      if (!frame) {
+        return fdb_to_error(frame.error());
+      }
+      if (!*frame) {
+        return KVRGW_ERR_CORRUPT_VALUE;
+      }
+      v_obj->attr_frame = std::move(**frame);
     }
 
     std::string data;
@@ -3964,7 +4044,7 @@ KvrgwErrorCode KvRgwServiceImpl::load_object_for_read(
   if (load_kv_data) {
     auto result_res = load_object_with_data(bucket_id, object_name);
     if (!result_res) {
-      return fdb_to_error(result_res.error());
+      return result_res.error();
     }
     if (!*result_res) {
       return KVRGW_ERR_NO_SUCH_KEY;

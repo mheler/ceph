@@ -522,7 +522,7 @@ class KvRgwServiceImpl final {
   std::expected<std::optional<ObjectValue>, fdb_error_t>
   load_object(bucket_id_t bucket_id, const std::string& object_name);
 
-  std::expected<std::optional<LoadResult>, fdb_error_t>
+  std::expected<std::optional<LoadResult>, KvrgwErrorCode>
   load_object_with_data(bucket_id_t bucket_id, const std::string& object_name);
 
   KvrgwErrorCode load_object_for_read(

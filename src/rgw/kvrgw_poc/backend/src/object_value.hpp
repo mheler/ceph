@@ -187,6 +187,17 @@ struct ObjectValue {
   uint8_t chunk_data_ref_tag[kRefTagSize]{};
 };
 
+// GC entries carry the object flags so the worker knows which child keys
+// and shared data the object owned.
+inline GcValueHeader gc_header_for(const ObjectValue& value) {
+  GcValueHeader hdr{};
+  hdr.chunk = value.hdr.chunk;
+  hdr.flags = value.hdr.flags;
+  hdr.object_size = value.hdr.size;
+  hdr.mtime = value.hdr.last_modified_sec;
+  return hdr;
+}
+
 struct BucketValue {
   bucket_id_t bucket_id{};
   int64_t created_at_unix{};

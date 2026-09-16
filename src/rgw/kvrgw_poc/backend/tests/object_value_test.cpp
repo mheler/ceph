@@ -166,6 +166,22 @@ void test_is_delete_marker_flag()
   assert(value.has_extended_attrs());
 }
 
+void test_gc_header_for_copies_flags()
+{
+  kvrgw::ObjectValue value;
+  value.hdr.chunk.type = kvrgw::CHUNK_STORAGE;
+  value.hdr.flags = kvrgw::ObjectValue::kFlagExternalTags |
+                    kvrgw::ObjectValue::kFlagSharedData;
+  value.hdr.size = 4096;
+  value.hdr.last_modified_sec = 1700000000;
+
+  const auto gc = kvrgw::gc_header_for(value);
+  assert(gc.chunk.type == kvrgw::CHUNK_STORAGE);
+  assert(gc.flags == value.hdr.flags);
+  assert(gc.object_size == 4096);
+  assert(gc.mtime == 1700000000);
+}
+
 void test_child_value_header_layout()
 {
   kvrgw::ChildValueHeader hdr{};
@@ -284,6 +300,7 @@ int main()
   test_bucket_value_versioning_state();
   test_object_value_header_version_fields();
   test_is_delete_marker_flag();
+  test_gc_header_for_copies_flags();
   test_child_value_header_layout();
   test_tag_encode_exact_size();
   test_inline_metadata_frame_roundtrip();

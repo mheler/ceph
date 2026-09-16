@@ -1493,12 +1493,7 @@ bool KvRgwServiceImpl::move_object_to_g(KvTransaction &tr,
 
   if (must_defer_to_gc) {
     const auto go_key = make_go_key(*parts, ref_tag_sv, value.hdr.size);
-    GcValueHeader gc_hdr{};
-    gc_hdr.chunk = value.hdr.chunk;
-    gc_hdr.flags = value.hdr.flags;
-    gc_hdr.object_size = value.hdr.size;
-    gc_hdr.mtime = value.hdr.last_modified_sec;
-    tr.kv_put(go_key.view(), make_gc_value(gc_hdr));
+    tr.kv_put(go_key.view(), make_gc_value(gc_header_for(value)));
     tr.kv_del(object_key);
   }
   else {
@@ -1608,12 +1603,7 @@ void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
 
         if (must_defer) {
           const auto go_key = make_go_key(*parts, ref_sv, null_obj->hdr.size);
-          GcValueHeader gc_hdr{};
-          gc_hdr.chunk = null_obj->hdr.chunk;
-          gc_hdr.flags = null_obj->hdr.flags;
-          gc_hdr.object_size = null_obj->hdr.size;
-          gc_hdr.mtime = null_obj->hdr.last_modified_sec;
-          tr.kv_put(go_key.view(), make_gc_value(gc_hdr));
+          tr.kv_put(go_key.view(), make_gc_value(gc_header_for(*null_obj)));
         }
         else {
           const uint8_t st = d_size_tier_from_size(null_obj->hdr.size);
@@ -2955,11 +2945,7 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
           }
           else if (current->hdr.chunk.type == CHUNK_STORAGE) {
             const auto go_key = make_go_key(*parts, ref_sv, current->hdr.size);
-            GcValueHeader gc_hdr{};
-            gc_hdr.chunk = current->hdr.chunk;
-            gc_hdr.object_size = current->hdr.size;
-            gc_hdr.mtime = current->hdr.last_modified_sec;
-            tr->kv_put(go_key.view(), make_gc_value(gc_hdr));
+            tr->kv_put(go_key.view(), make_gc_value(gc_header_for(*current)));
           }
         }
       }
@@ -3006,11 +2992,7 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
           const std::string_view ref_sv(
               reinterpret_cast<const char *>(v_entry->hdr.ref_tag), 12);
           const auto go_key = make_go_key(*parts, ref_sv, v_entry->hdr.size);
-          GcValueHeader gc_hdr{};
-          gc_hdr.chunk = v_entry->hdr.chunk;
-          gc_hdr.object_size = v_entry->hdr.size;
-          gc_hdr.mtime = v_entry->hdr.last_modified_sec;
-          tr->kv_put(go_key.view(), make_gc_value(gc_hdr));
+          tr->kv_put(go_key.view(), make_gc_value(gc_header_for(*v_entry)));
         }
       }
       tr->kv_del(v_key.view());

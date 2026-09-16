@@ -212,6 +212,7 @@ struct BucketValue {
 };
 
 std::optional<ObjectValue> parse_object_value(std::string_view data);
+bool write_object_value(OValueBuf& buf, const ObjectValue& value);
 std::span<const uint8_t> object_inline_metadata_bytes(std::string_view data);
 
 void child_hdr_to_be(ChildValueHeader& hdr);

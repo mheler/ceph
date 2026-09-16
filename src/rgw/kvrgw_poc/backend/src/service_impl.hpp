@@ -185,7 +185,6 @@ class TierConfigState;
 
 class KvRgwGrpcService;
 
-bool write_object_value(OValueBuf& buf, const ObjectValue& value);
 void apply_tags_to_value(ObjectValue& obj, std::span<const uint8_t> encoded,
                          KvTransaction& tr, bucket_id_t bucket_id,
                          std::string_view ref_tag);

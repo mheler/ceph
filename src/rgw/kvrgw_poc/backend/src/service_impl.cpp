@@ -175,47 +175,6 @@ bool is_valid_bucket_name(std::string_view name)
 
 } // namespace
 
-bool write_object_value(OValueBuf &buf, const ObjectValue &value)
-{
-  ObjectValueHeader wire = value.hdr;
-  wire.content_type_len = static_cast<uint8_t>(value.content_type.size());
-  hdr_to_be(wire);
-  if (!buf.set_header(wire)) {
-    return false;
-  }
-  if (!buf.append(value.content_type.data(), value.content_type.size())) {
-    return false;
-  }
-  if (value.hdr.chunk.type == CHUNK_INLINE && !value.inline_data.empty()) {
-    if (!buf.append(value.inline_data.data(), value.inline_data.size())) {
-      return false;
-    }
-  }
-  if (value.hdr.chunk.type == CHUNK_CHILD_D_REF) {
-    uint64_t bid_be = htobe64(value.chunk_data_bucket_id);
-    if (!buf.append(&bid_be, 8)) {
-      return false;
-    }
-    if (!buf.append(value.chunk_data_ref_tag, kRefTagSize)) {
-      return false;
-    }
-  }
-  else if (value.hdr.chunk.type == CHUNK_STORAGE_REF) {
-    if (!buf.append(value.chunk_data_ref_tag, kRefTagSize)) {
-      return false;
-    }
-  }
-  if (value.hdr.metadata_count > 0) {
-    if (value.metadata_frame.empty()) {
-      return false;
-    }
-    if (!buf.append(value.metadata_frame.data(), value.metadata_frame.size())) {
-      return false;
-    }
-  }
-  return true;
-}
-
 // --- BatchCommitQueue ---
 
 BatchCommitQueue::BatchCommitQueue(KvRgwServiceImpl &service)

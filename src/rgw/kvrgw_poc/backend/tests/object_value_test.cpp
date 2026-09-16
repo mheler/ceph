@@ -285,6 +285,37 @@ void test_inline_metadata_frame_roundtrip()
   assert(meta[0].second == "blue");
 }
 
+void test_write_object_value_roundtrip_and_overflow()
+{
+  kvrgw::ObjectValue value;
+  std::memset(value.hdr.ref_tag, 0x11, 12);
+  value.hdr.size = 7;
+  value.hdr.chunk.type = kvrgw::CHUNK_INLINE;
+  value.inline_data.assign(7, 0x42);
+  value.content_type = "application/octet-stream";
+
+  kvrgw::OValueBuf buf;
+  assert(kvrgw::write_object_value(buf, value));
+  assert(buf.len == sizeof(kvrgw::ObjectValueHeader) +
+                        value.content_type.size() + 7);
+  const auto parsed = kvrgw::parse_object_value(buf.view());
+  assert(parsed);
+  assert(parsed->inline_data == value.inline_data);
+  assert(parsed->content_type == value.content_type);
+
+  // A metadata count without a frame is a caller bug, not a valid value.
+  value.hdr.metadata_count = 1;
+  kvrgw::OValueBuf no_frame;
+  assert(!kvrgw::write_object_value(no_frame, value));
+
+  // Anything past the 1024 B record cap is rejected, never truncated.
+  value.hdr.metadata_count = 0;
+  value.inline_data.assign(kvrgw::kMaxOValueBytes, 0x42);
+  value.hdr.size = value.inline_data.size();
+  kvrgw::OValueBuf too_big;
+  assert(!kvrgw::write_object_value(too_big, value));
+}
+
 void test_child_d_header_then_data()
 {
   const std::string data(32, 'x');
@@ -320,6 +351,7 @@ int main()
   test_child_value_header_layout();
   test_tag_encode_exact_size();
   test_inline_metadata_frame_roundtrip();
+  test_write_object_value_roundtrip_and_overflow();
   test_child_d_header_then_data();
   std::cout << "object_value_test passed\n";
   return 0;

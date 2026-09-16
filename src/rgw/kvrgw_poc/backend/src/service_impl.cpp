@@ -1515,14 +1515,8 @@ bool KvRgwServiceImpl::move_object_to_g(KvTransaction &tr,
                                value.has_shared_data());
     }
 
-    if (value.has_external_tags()) {
-      const auto ct_key = make_ct_key(parts->bucket_id, ref_tag_sv);
-      tr.kv_del(ct_key.view());
-    }
-    if (value.has_extended_attrs()) {
-      const auto ce_key = make_c_prefix(parts->bucket_id, ref_tag_sv);
-      const auto ce_end = std::string(ce_key.view()) + "\xFF";
-      tr.kv_range_clear(ce_key.view(), ce_end);
+    if (value.has_child_keys()) {
+      clear_child_keys(tr, parts->bucket_id, ref_tag_sv);
     }
 
     tr.kv_del(object_key);
@@ -1625,14 +1619,8 @@ void KvRgwServiceImpl::displace_old_object(KvTransaction &tr,
                                      null_obj->has_shared_data());
           }
 
-          if (null_obj->has_external_tags()) {
-            const auto ct_key = make_ct_key(parts->bucket_id, ref_sv);
-            tr.kv_del(ct_key.view());
-          }
-          if (null_obj->has_extended_attrs()) {
-            const auto ce_key = make_c_prefix(parts->bucket_id, ref_sv);
-            const auto ce_end = std::string(ce_key.view()) + "\xFF";
-            tr.kv_range_clear(ce_key.view(), ce_end);
+          if (null_obj->has_child_keys()) {
+            clear_child_keys(tr, parts->bucket_id, ref_sv);
           }
         }
       }

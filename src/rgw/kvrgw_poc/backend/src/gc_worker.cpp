@@ -153,17 +153,13 @@ void GcWorker::gc_once(const GcPolicy &policy, RateWindow *rate)
     const bool shared =
         gc_val && (gc_val->hdr.flags & ObjectValue::kFlagSharedData);
 
-    const bool has_external_children =
-        gc_val && (gc_val->hdr.flags & kFlagExternalTags);
+    const bool has_child_keys =
+        gc_val && (gc_val->hdr.flags & ObjectValue::kFlagChildKeys);
     const auto rt_view = ref_tag_view(parts->ref_tag);
     auto clean_children = [&](KvTransaction &txn) {
-      if (!has_external_children) {
-        return;
+      if (has_child_keys) {
+        clear_child_keys(txn, parts->bucket_id, rt_view);
       }
-      auto c_prefix = make_c_prefix(parts->bucket_id, rt_view);
-      auto c_end = c_prefix;
-      c_end.append_byte(0xFF);
-      txn.kv_range_clear(c_prefix.view(), c_end.view());
     };
 
     if (ct == CHUNK_STORAGE || ct == CHUNK_STORAGE_REF) {

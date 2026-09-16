@@ -157,7 +157,12 @@ struct ObjectValue {
   static constexpr uint8_t kFlagExternalTags         = 0x08;
   static constexpr uint8_t kFlagExternalAnnotations  = 0x10;
 
+  // Flags that mean the object owns keys under C:<ref_tag>.
+  static constexpr uint8_t kFlagChildKeys =
+      kFlagExtendedAttrs | kFlagExternalTags | kFlagExternalAnnotations;
+
   bool has_extended_attrs() const { return (hdr.flags & kFlagExtendedAttrs) != 0; }
+  bool has_child_keys() const { return (hdr.flags & kFlagChildKeys) != 0; }
   bool has_annotations() const { return hdr.annotations_count > 0; }
   bool has_external_annotations() const { return (hdr.flags & kFlagExternalAnnotations) && hdr.annotations_count > 0; }
   bool has_metadata() const { return hdr.metadata_count > 0; }
@@ -219,6 +224,8 @@ std::string_view child_value_payload(std::string_view data, uint64_t payload_siz
 class KvTransaction;
 void decrement_or_del_child_d(KvTransaction& tr, std::string_view d_key,
                               uint64_t object_size, bool shared);
+void clear_child_keys(KvTransaction& tr, bucket_id_t bucket_id,
+                      std::string_view ref_tag);
 
 std::string make_bucket_value(bucket_id_t bucket_id, int64_t created_at_unix,
                               uint8_t access_flags = 0, VersioningState versioning_state = VERSIONING_DISABLED,

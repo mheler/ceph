@@ -166,6 +166,21 @@ void test_is_delete_marker_flag()
   assert(value.has_extended_attrs());
 }
 
+void test_has_child_keys_covers_every_child_type()
+{
+  kvrgw::ObjectValue value;
+  assert(!value.has_child_keys());
+  for (uint8_t flag : {kvrgw::ObjectValue::kFlagExtendedAttrs,
+                       kvrgw::ObjectValue::kFlagExternalTags,
+                       kvrgw::ObjectValue::kFlagExternalAnnotations}) {
+    value.hdr.flags = flag;
+    assert(value.has_child_keys());
+  }
+  value.hdr.flags =
+      kvrgw::ObjectValue::kFlagFenced | kvrgw::ObjectValue::kFlagSharedData;
+  assert(!value.has_child_keys());
+}
+
 void test_gc_header_for_copies_flags()
 {
   kvrgw::ObjectValue value;
@@ -300,6 +315,7 @@ int main()
   test_bucket_value_versioning_state();
   test_object_value_header_version_fields();
   test_is_delete_marker_flag();
+  test_has_child_keys_covers_every_child_type();
   test_gc_header_for_copies_flags();
   test_child_value_header_layout();
   test_tag_encode_exact_size();

@@ -12,11 +12,21 @@
  *
  */
 
+#include "keys.hpp"
 #include "kv_store.hpp"
 #include "object_value.hpp"
 #include "ref_count.hpp"
 
 namespace kvrgw {
+
+void clear_child_keys(KvTransaction &tr, bucket_id_t bucket_id,
+                      std::string_view ref_tag)
+{
+  auto prefix = make_c_prefix(bucket_id, ref_tag);
+  auto end = prefix;
+  end.append_byte(0xFF);
+  tr.kv_range_clear(prefix.view(), end.view());
+}
 
 void decrement_or_del_child_d(KvTransaction &tr, std::string_view d_key,
                               uint64_t object_size, bool shared)

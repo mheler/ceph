@@ -2884,6 +2884,12 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
         return ec;
       }
 
+      // Frees data and child keys and deletes O:; the promote below
+      // rewrites O: in the same transaction when a version remains.
+      if (!move_object_to_g(*tr, object_key.view(), *current)) {
+        return KVRGW_ERR_CORRUPT_VALUE;
+      }
+
       if (!v_scan->empty()) {
         auto promoted = parse_object_value(v_scan->front().value);
         if (promoted) {
@@ -2894,28 +2900,6 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
           }
           tr->kv_put(object_key.view(), pbuf.view());
           tr->kv_del(std::string_view(v_scan->front().key));
-        }
-      }
-      else {
-        tr->kv_del(object_key.view());
-      }
-
-      if (current->has_data()) {
-        const auto parts = parse_object_key(object_key.view());
-        if (parts) {
-          const std::string_view ref_sv(
-              reinterpret_cast<const char *>(current->hdr.ref_tag), 12);
-          if (current->hdr.chunk.type == CHUNK_CHILD_D) {
-            const uint8_t st = d_size_tier_from_size(current->hdr.size);
-            const uint32_t mtime =
-                static_cast<uint32_t>(current->hdr.last_modified_sec);
-            const auto d_key = make_d_key(parts->bucket_id, st, ref_sv, mtime);
-            tr->kv_del(d_key.view());
-          }
-          else if (current->hdr.chunk.type == CHUNK_STORAGE) {
-            const auto go_key = make_go_key(*parts, ref_sv, current->hdr.size);
-            tr->kv_put(go_key.view(), make_gc_value(gc_header_for(*current)));
-          }
         }
       }
     }
@@ -2955,7 +2939,7 @@ KvrgwErrorCode KvRgwServiceImpl::delete_object_version(
           return KVRGW_ERR_PRECONDITION_FAILED;
         }
       }
-      if (v_entry && v_entry->has_data()) {
+      if (v_entry && (v_entry->has_data() || v_entry->has_child_keys())) {
         const auto parts = parse_object_key(object_key.view());
         if (parts) {
           const std::string_view ref_sv(

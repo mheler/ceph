@@ -49,6 +49,7 @@ set(KVRGW_LIB_SRCS
   src/byte_range.cpp
   src/id_tag.cpp
   src/id_meta.cpp
+  src/attr_frame.cpp
   src/service_impl.cpp
   src/bucket_policy.cpp
   src/sweeper.cpp
@@ -112,6 +113,9 @@ target_include_directories(object_value_test PRIVATE
   "${CMAKE_SOURCE_DIR}/src"
 )
 target_link_libraries(object_value_test PRIVATE OpenSSL::Crypto)
+
+add_executable(attr_frame_test tests/attr_frame_test.cpp src/attr_frame.cpp)
+target_include_directories(attr_frame_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
 
 add_executable(l_key_test tests/l_key_test.cpp src/keys.cpp)
 target_include_directories(l_key_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -204,6 +208,7 @@ set_target_properties(kvrgw_c_abi_test PROPERTIES
 
 enable_testing()
 add_test(NAME object_value_test COMMAND object_value_test)
+add_test(NAME attr_frame_test COMMAND attr_frame_test)
 add_test(NAME l_key_test COMMAND l_key_test)
 add_test(NAME data_store_test COMMAND data_store_test)
 add_test(NAME kv_range_test COMMAND kv_range_test)

@@ -5741,6 +5741,7 @@ class RGWTransitionDPF : public RGWRecompressDPF {
   RGWObjectCtx& obj_ctx;
   rgw_obj& obj;
   std::string dest_compression;
+  std::string dest_crypt_mode;
   bool compress_encrypted_enabled;
 
   /* pre-fetched by transition_obj() and passed to constructor */
@@ -5763,7 +5764,8 @@ protected:
   {
     return rgw_prepare_reencrypt_object(dpp, cct, dest_attrs,
                                         obj.bucket.bucket_id,
-                                        obj.key.name, y, crypt);
+                                        obj.key.name, dest_crypt_mode,
+                                        y, crypt);
   }
 
   const std::string& get_dest_compression() override { return dest_compression; }
@@ -5781,11 +5783,13 @@ public:
                    RGWObjectCtx& obj_ctx_,
                    rgw_obj& obj_,
                    const std::string& dest_compression_,
+                   const std::string& dest_crypt_mode_,
                    bool compress_encrypted,
                    std::unique_ptr<BlockCrypt> decrypt)
     : RGWRecompressDPF(cct_, obj_size, src_attrs),
       obj_ctx(obj_ctx_), obj(obj_),
       dest_compression(dest_compression_),
+      dest_crypt_mode(dest_crypt_mode_),
       compress_encrypted_enabled(compress_encrypted),
       prefetched_decrypt(std::move(decrypt))
   {}
@@ -5882,21 +5886,38 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
   bool need_recompress = !already_matches;
 
   /*
-   * Retrieve the decryption key when the source is encrypted
-   * and compression needs to change. The re-encryption path will
-   * fetch the same key again from the backend (after regenerating
-   * the GCM salt for AEAD modes) — a second KMS/SSE-S3 round-trip
-   * per transitioned object.
+   * Moving the object onto the configured algorithm is a second reason
+   * to run the pipeline, so one whose compression already matches still
+   * comes off cbc. Gated on the zonegroup feature because it rewrites
+   * stored objects that peers can read as they stand today. Empty means
+   * the object keeps the mode it has.
+   */
+  const std::string src_mode = get_str_attribute(attrs, RGW_ATTR_CRYPT_MODE);
+  std::string dest_crypt_mode;
+  if (is_encrypted && svc.zone->get_zonegroup().supports(
+          rgw::zone_features::transition_reencrypt)) {
+    std::string configured = rgw_upgraded_crypt_mode(cct, src_mode);
+    if (configured != src_mode) {
+      dest_crypt_mode = std::move(configured);
+    }
+  }
+
+  /*
+   * Retrieve the decryption key when the source is encrypted and the
+   * pipeline is going to run. The re-encryption path will fetch the
+   * same key again from the backend (after regenerating the GCM salt
+   * for AEAD modes) — a second KMS/SSE-S3 round-trip per object.
    */
   std::unique_ptr<BlockCrypt> decrypt_crypt;
 
   if (obj_size == 0) {
     ldpp_dout(dpp, 20) << __func__ << " " << obj
-        << " is empty, skipping recompression" << dendl;
+        << " is empty, nothing to recompress or re-encrypt" << dendl;
     need_recompress = false;
+    dest_crypt_mode.clear();
   }
 
-  if (need_recompress && is_encrypted) {
+  if ((need_recompress || !dest_crypt_mode.empty()) && is_encrypted) {
     ret = rgw_prepare_decrypt_object(
         dpp, cct, attrs,
         bucket_info.bucket.bucket_id, obj.key.name,
@@ -5919,20 +5940,28 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
       }
       ldpp_dout(dpp, 10) << __func__ << " " << obj
           << " encrypted but cannot decrypt, copying as-is" << dendl;
+      /*
+       * Without the source key there is nothing to re-encrypt from, and
+       * running the encrypt half alone would encrypt the ciphertext a
+       * second time and label it with the new mode.
+       */
       need_recompress = false;
+      dest_crypt_mode.clear();
     } else {
-      ldpp_dout(dpp, 10) << __func__ << " re-encrypting "
-          << obj << " for recompression" << dendl;
+      ldpp_dout(dpp, 10) << __func__ << " re-encrypting " << obj
+          << " recompress=" << need_recompress
+          << " dest_crypt_mode=" << dest_crypt_mode << dendl;
     }
   }
 
   bool compress_encrypted = svc.zone->get_zonegroup().supports(
       rgw::zone_features::compress_encrypted);
 
-  if (need_recompress) {
+  if (need_recompress || !dest_crypt_mode.empty()) {
     transition_dpf.emplace(cct, obj_size, attrs,
                            obj_ctx, obj,
                            dest_compression,
+                           dest_crypt_mode,
                            compress_encrypted,
                            std::move(decrypt_crypt));
     dp_factory = &*transition_dpf;

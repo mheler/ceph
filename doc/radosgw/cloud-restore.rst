@@ -269,6 +269,8 @@ per `S3 RestoreObject <https://docs.aws.amazon.com/AmazonS3/latest/API/API_Resto
 API the storage class of restored objects should remain unchanged. Therefore, for
 temporary copies, the ``x-amz-storage-class`` will continue to reflect the
 original cloud-tier storage class.
+Permanent restores of unencrypted, uncompressed cloud data use the restore
+storage class's compression setting; temporary restores keep the cloud form.
 
 
 mtime

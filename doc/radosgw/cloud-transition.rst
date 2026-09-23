@@ -430,6 +430,7 @@ to true. However a ``GET`` operation on such an object will still fail
 with an ``InvalidObjectState`` error. Any other operations against original
 source objects will be for its metadata entries only keeping transitioned
 objects intact.
+Encrypted objects are skipped when ``retain_head_object`` is false.
 
 For example:
 

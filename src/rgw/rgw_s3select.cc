@@ -593,7 +593,6 @@ int RGWSelectObj_ObjStore_S3::run_s3select_on_json(const char* query, const char
 int RGWSelectObj_ObjStore_S3::handle_aws_cli_parameters(std::string& sql_query)
 {
   std::string input_tag{"InputSerialization"};
-  std::string output_tag{"OutputSerialization"};
   if (chunk_number !=0) {
     return 0;
   }
@@ -624,9 +623,7 @@ int RGWSelectObj_ObjStore_S3::handle_aws_cli_parameters(std::string& sql_query)
 
   extract_by_tag(m_s3select_query, "Expression", sql_query);
   extract_by_tag(m_s3select_query, "Enabled", m_enable_progress);
-  size_t _qi = m_s3select_query.find("<" + input_tag + ">", 0);
-  size_t _qe = m_s3select_query.find("</" + input_tag + ">", _qi);
-  m_s3select_input = m_s3select_query.substr(_qi + input_tag.size() + 2, _qe - (_qi + input_tag.size() + 2));
+  extract_by_tag(m_s3select_query, input_tag, m_s3select_input);
   extract_by_tag(m_s3select_input, "FieldDelimiter", m_column_delimiter);
   extract_by_tag(m_s3select_input, "QuoteCharacter", m_quot);
   extract_by_tag(m_s3select_input, "RecordDelimiter", m_row_delimiter);
@@ -640,9 +637,7 @@ int RGWSelectObj_ObjStore_S3::handle_aws_cli_parameters(std::string& sql_query)
   }
   extract_by_tag(m_s3select_input, "QuoteEscapeCharacter", m_escape_char);
   extract_by_tag(m_s3select_input, "CompressionType", m_compression_type);
-  size_t _qo = m_s3select_query.find("<" + output_tag + ">", 0);
-  size_t _qs = m_s3select_query.find("</" + output_tag + ">", _qi);
-  m_s3select_output = m_s3select_query.substr(_qo + output_tag.size() + 2, _qs - (_qo + output_tag.size() + 2));
+  extract_by_tag(m_s3select_query, "OutputSerialization", m_s3select_output);
   extract_by_tag(m_s3select_output, "FieldDelimiter", output_column_delimiter);
   extract_by_tag(m_s3select_output, "QuoteCharacter", output_quot);
   extract_by_tag(m_s3select_output, "QuoteEscapeCharacter", output_escape_char);

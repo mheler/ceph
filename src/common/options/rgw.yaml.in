@@ -1352,6 +1352,15 @@ options:
   see_also:
   - rgw_max_concurrent_requests
   with_legacy: true
+- name: rgw_heap_release_interval
+  type: secs
+  level: advanced
+  desc: How often RGW gives free TCMalloc memory back to the OS
+  long_desc: Each interval, RGW asks TCMalloc to hand memory it is no longer
+    using back to the OS. 0 turns it off.
+  default: 0
+  services:
+  - rgw
 - name: rgw_num_control_oids
   type: int
   level: advanced

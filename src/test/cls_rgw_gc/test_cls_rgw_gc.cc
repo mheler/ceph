@@ -531,6 +531,81 @@ TEST_P(TestClsRgwGc, gc_queue_ops9)
   ASSERT_EQ(-ENOSPC, ioctx.operate(queue_name, &defer_op));
 }
 
+TEST_P(TestClsRgwGc, gc_queue_list_op_form)
+{
+  //Testing list queue through an ObjectReadOperation
+  string queue_name = "my-op-form-queue";
+  uint64_t queue_size = 1024, num_urgent_data_entries = 10;
+  librados::ObjectWriteOperation op;
+  op.create(true);
+  cls_rgw_gc_queue_init(op, queue_size, num_urgent_data_entries);
+  ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+
+  //Test enqueue
+  for (int i = 0; i < 3; i++) {
+    string tag = "chain-" + to_string(i);
+    librados::ObjectWriteOperation op;
+    cls_rgw_gc_obj_info info;
+
+    cls_rgw_obj obj1, obj2;
+    create_obj(obj1, i, 1);
+    create_obj(obj2, i, 2);
+    info.chain.objs.push_back(obj1);
+    info.chain.objs.push_back(obj2);
+
+    info.tag = tag;
+    cls_rgw_gc_queue_enqueue(op, 0, info);
+    ASSERT_EQ(0, ioctx.operate(queue_name, &op));
+  }
+
+  auto list_op_form = [&] (const string& marker, vector<cls_rgw_gc_obj_info>& entries,
+                           bool& truncated, string& next_marker) {
+    librados::ObjectReadOperation rop;
+    bufferlist out;
+    cls_rgw_gc_queue_list_entries(rop, marker, 2, false, out);
+    int r = ioctx.operate(queue_name, &rop, nullptr);
+    if (r < 0) {
+      return r;
+    }
+    return cls_rgw_gc_queue_list_entries_decode(out, entries, &truncated, next_marker);
+  };
+
+  //Test list queue in two pages
+  vector<cls_rgw_gc_obj_info> entries1, entries2;
+  string marker, next_marker1, next_marker2;
+  bool truncated1 = false, truncated2 = true;
+  ASSERT_EQ(0, list_op_form(marker, entries1, truncated1, next_marker1));
+  ASSERT_EQ(2, entries1.size());
+  ASSERT_TRUE(truncated1);
+  ASSERT_FALSE(next_marker1.empty());
+  ASSERT_EQ("chain-0", entries1[0].tag);
+  ASSERT_EQ("chain-1", entries1[1].tag);
+
+  ASSERT_EQ(0, list_op_form(next_marker1, entries2, truncated2, next_marker2));
+  ASSERT_EQ(1, entries2.size());
+  ASSERT_FALSE(truncated2);
+  ASSERT_EQ("chain-2", entries2[0].tag);
+
+  //Test the IoCtx form returns the same pages
+  list<cls_rgw_gc_obj_info> list_info1, list_info2;
+  string io_marker1, io_marker2;
+  bool io_truncated1 = false, io_truncated2 = true;
+  ASSERT_EQ(0, cls_rgw_gc_queue_list_entries(ioctx, queue_name, marker, 2, false,
+                                             list_info1, io_truncated1, io_marker1));
+  ASSERT_EQ(2, list_info1.size());
+  ASSERT_TRUE(io_truncated1);
+  ASSERT_EQ(next_marker1, io_marker1);
+  ASSERT_EQ("chain-0", list_info1.front().tag);
+  ASSERT_EQ("chain-1", list_info1.back().tag);
+
+  ASSERT_EQ(0, cls_rgw_gc_queue_list_entries(ioctx, queue_name, io_marker1, 2, false,
+                                             list_info2, io_truncated2, io_marker2));
+  ASSERT_EQ(1, list_info2.size());
+  ASSERT_FALSE(io_truncated2);
+  ASSERT_EQ(next_marker2, io_marker2);
+  ASSERT_EQ("chain-2", list_info2.front().tag);
+}
+
 INSTANTIATE_TEST_SUITE_P(, TestClsRgwGc,
   ::testing::Values(PoolType::REPLICATED, PoolType::FAST_EC),
   [](const ::testing::TestParamInfo<PoolType>& info) {

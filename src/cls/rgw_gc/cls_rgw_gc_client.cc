@@ -12,6 +12,7 @@
 
 using std::list;
 using std::string;
+using std::vector;
 
 using ceph::decode;
 using ceph::encode;
@@ -62,17 +63,40 @@ void cls_rgw_gc_queue_enqueue(ObjectWriteOperation& op, uint32_t expiration_secs
 int cls_rgw_gc_queue_list_entries(IoCtx& io_ctx, const string& oid, const string& marker, uint32_t max, bool expired_only,
                                   list<cls_rgw_gc_obj_info>& entries, bool& truncated, string& next_marker)
 {
-  bufferlist in, out;
-  cls_rgw_gc_list_op op;
-  op.marker = marker;
-  op.max = max;
-  op.expired_only = expired_only;
-  encode(op, in);
+  ObjectReadOperation op;
+  bufferlist out;
+  cls_rgw_gc_queue_list_entries(op, marker, max, expired_only, out);
 
-  int r = io_ctx.exec(oid, method::list_entries, in, out);
+  int r = io_ctx.operate(oid, &op, nullptr);
   if (r < 0)
     return r;
 
+  vector<cls_rgw_gc_obj_info> result;
+  r = cls_rgw_gc_queue_list_entries_decode(out, result, &truncated, next_marker);
+  if (r < 0)
+    return r;
+
+  entries.assign(std::make_move_iterator(result.begin()),
+                 std::make_move_iterator(result.end()));
+  return 0;
+}
+
+void cls_rgw_gc_queue_list_entries(ObjectReadOperation& op, const string& marker, uint32_t max,
+                                   bool expired_only, bufferlist& out)
+{
+  bufferlist in;
+  cls_rgw_gc_list_op call;
+  call.marker = marker;
+  call.max = max;
+  call.expired_only = expired_only;
+  encode(call, in);
+  op.exec(method::list_entries, in, &out, nullptr);
+}
+
+int cls_rgw_gc_queue_list_entries_decode(const bufferlist& out,
+                                         vector<cls_rgw_gc_obj_info>& entries,
+                                         bool* truncated, string& next_marker)
+{
   cls_rgw_gc_list_ret ret;
   auto iter = out.cbegin();
   try {
@@ -81,12 +105,12 @@ int cls_rgw_gc_queue_list_entries(IoCtx& io_ctx, const string& oid, const string
     return -EIO;
   }
 
-  entries.swap(ret.entries);
-
-  truncated = ret.truncated;
-
+  entries.assign(std::make_move_iterator(ret.entries.begin()),
+                 std::make_move_iterator(ret.entries.end()));
+  if (truncated) {
+    *truncated = ret.truncated;
+  }
   next_marker = std::move(ret.next_marker);
-
   return 0;
 }
 

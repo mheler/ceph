@@ -423,6 +423,11 @@ add_executable(unittest_rgw_shard_io test_rgw_shard_io.cc)
 add_ceph_unittest(unittest_rgw_shard_io)
 target_link_libraries(unittest_rgw_shard_io ${rgw_libs} unit-main ${UNITTEST_LIBS})
 
+# unittest_rgw_gc_trim
+add_executable(unittest_rgw_gc_trim test_rgw_gc_trim.cc)
+add_ceph_unittest(unittest_rgw_gc_trim)
+target_link_libraries(unittest_rgw_gc_trim ceph-common ${UNITTEST_LIBS})
+
 # unittest_rgw_object_ctx
 add_executable(unittest_rgw_object_ctx test_rgw_object_ctx.cc)
 add_ceph_unittest(unittest_rgw_object_ctx)

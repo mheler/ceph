@@ -266,13 +266,14 @@ static void throw_if_op_cancelled(int r, const boost::asio::yield_context& y)
   }
 }
 
-int RGWGC::list_shard(int index, std::string& marker, uint32_t max, bool expired_only,
+int RGWGC::list_shard(int index, std::string& marker, uint32_t max,
                       std::vector<cls_rgw_gc_obj_info>& entries, bool& truncated,
                       boost::asio::yield_context y)
 {
   librados::ObjectReadOperation op;
   bufferlist bl;
-  cls_rgw_gc_queue_list_entries(op, marker, max, expired_only, bl);
+  // removal counts unexpired entries too, so list them all
+  cls_rgw_gc_queue_list_entries(op, marker, max, false, bl);
   int ret = store->gc_operate(this, obj_names[index], std::move(op), nullptr, y);
   throw_if_op_cancelled(ret, y);
   std::string next_marker;
@@ -533,39 +534,47 @@ void RGWGC::process_queue(int index, Clock::time_point deadline, bool expired_on
 {
   // the children use these, so they outlive the try below
   rgw::gc_trim_tracker tracker;
+  bool trim_failed = false;
   ceph::async::spawn_throttle workpool{yield, max_concurrent_io(cct)};
+
+  // remove the finished prefix of the queue
+  auto trim = [&] {
+    const size_t count = tracker.untrimmed();
+    if (trim_failed || count == 0) {
+      return;
+    }
+    // a failed removal may have applied, so stop trimming in this lease
+    trim_failed = trim_shard(index, count, l, yield) < 0;
+    if (!trim_failed) {
+      tracker.trimmed(count);
+    }
+  };
 
   std::exception_ptr eptr;
   try {
+    const auto now_real = ceph::real_clock::now();
     std::string marker;
     bool truncated = true;
-    while (truncated) {
+    bool stop = false;
+    while (!stop && !trim_failed && truncated) {
       std::vector<cls_rgw_gc_obj_info> entries;
-      if (list_shard(index, marker, list_max, expired_only, entries, truncated,
-                     yield) < 0 || entries.empty()) {
+      if (list_shard(index, marker, list_max, entries, truncated, yield) < 0 ||
+          entries.empty()) {
         break;
       }
-      bool stop = false;
       for (const auto& info : entries) {
-        // past the deadline or after a failed delete, stop without a trim
-        if (Clock::now() >= deadline || tracker.failed()) {
+        // stop admitting at the deadline, a failed delete or the first unexpired entry
+        if (Clock::now() >= deadline || tracker.failed() ||
+            (expired_only && info.time > now_real)) {
           stop = true;
           break;
         }
         admit_entry(workpool, tracker, pool_ctxs, info);
       }
-      // trim the batch only once all of it finished
-      workpool.wait();
-      if (stop || tracker.failed()) {
-        break;
-      }
-      const size_t count = tracker.untrimmed();
-      if (trim_shard(index, count, l, yield) < 0) {
-        break;
-      }
-      tracker.trimmed(count);
+      trim();
     }
     workpool.wait();
+    trim();
   } catch (const std::exception&) {
     eptr = std::current_exception();
   }

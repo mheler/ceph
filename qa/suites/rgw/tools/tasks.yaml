@@ -16,6 +16,7 @@ tasks:
            - rgw/test_rgw_orphan_list.sh
            - rgw/test_rgw_heap_profiler.sh
            - rgw/run-radosgw-admin-exit-codes.sh
+           - rgw/test_rgw_gc.sh
     env:
       # rgw/run-radosgw-admin-exit-codes.sh creates a bucket with the aws CLI,
       # which sends the region as the LocationConstraint. The rgw task above
@@ -28,3 +29,6 @@ overrides:
         debug rgw: 20
         debug ms: 1
         rgw enable static website: false
+        # all gc entries on gc.0, processed only by the workunits
+        rgw gc max objs: 1
+        rgw enable gc threads: false

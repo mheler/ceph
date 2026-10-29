@@ -3676,6 +3676,40 @@ def test_object_content_encoding_aws_chunked():
     response = client.head_object(Bucket=bucket, Key=key)
     assert 'ContentEncoding' not in response
 
+def _put_streaming_trailer_object(bucket, key, trailer):
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    url = '{endpoint}/{bucket}/{key}'.format(
+        endpoint=get_config_endpoint(), bucket=bucket, key=key)
+    # one byte of data 'A', then the trailer section; crc32('A') is 09meiw==
+    body = b'1\r\nA\r\n0\r\nx-amz-checksum-crc32:09meiw==\r\n\r\n'
+    headers = {
+        'Content-Encoding': 'aws-chunked',
+        'X-Amz-Content-SHA256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+        'X-Amz-Decoded-Content-Length': '1',
+        'X-Amz-Trailer': trailer,
+        'Content-Length': str(len(body)),
+    }
+    creds = Credentials(get_main_aws_access_key(), get_main_aws_secret_key())
+    aws_request = AWSRequest(method='PUT', url=url, data=body, headers=headers)
+    SigV4Auth(creds, 's3', get_main_api_name()).add_auth(aws_request)
+    return requests.put(url, data=body, headers=dict(aws_request.headers.items()),
+                        verify=get_config_ssl_verify())
+
+@pytest.mark.fails_on_aws
+def test_put_object_streaming_trailer_duplicate_declaration():
+    bucket = get_new_bucket()
+
+    control = _put_streaming_trailer_object(bucket, 'control',
+                                            'x-amz-checksum-crc32')
+    assert control.status_code == 200
+
+    duplicate = _put_streaming_trailer_object(bucket, 'duplicate',
+                                              'x-amz-checksum-crc32,x-amz-checksum-crc32')
+    assert duplicate.status_code == 200
+
 def test_object_anon_put():
     bucket_name = get_new_bucket()
     client = get_client()

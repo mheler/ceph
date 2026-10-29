@@ -1476,7 +1476,7 @@ static inline ExtractResult extract_helper(const std::string_view& region,
 	epos != std::string_view::npos) {
       std::string_view matched = region.substr(spos, epos - spos);
       auto consumed = matched.size() + sarrlen(end.val);
-      return ExtractResult(true, matched, consumed);
+      return ExtractResult(true, matched, spos + consumed);
     }
   }
   return ExtractResult(false, "", 0);
@@ -1521,7 +1521,7 @@ inline void AWSv4ComplMulti::extract_trailing_headers(
 	/* populate to req_info.env as well */
 	put_prop(ys_header_mangle(fmt::format("HTTP-{}", k)), v);
       });
-      consumed += get<2>(ex_header);
+      consumed = std::max(consumed, get<2>(ex_header));
     } /* one trailer */
   } /* foreach trailer */
   /* advance mut_sv_trailer */

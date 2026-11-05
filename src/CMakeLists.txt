@@ -339,6 +339,7 @@ if(WITH_BREAKPAD)
 
   set(breakpad_SOURCE_DIR ${CMAKE_SOURCE_DIR}/src/breakpad)
   set(lss_SOURCE_DIR ${CMAKE_SOURCE_DIR}/src/lss)
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" breakpad_build_type)
 
   ExternalProject_Add(
     breakpad_project
@@ -351,9 +352,9 @@ if(WITH_BREAKPAD)
     # picky, and might fail the build because of warnings.
     CONFIGURE_COMMAND ${breakpad_SOURCE_DIR}/configure --disable-processor --disable-tools --prefix=<INSTALL_DIR>
             "CC=${CMAKE_C_COMPILER}"
-            "CFLAGS=${CMAKE_C_FLAGS} -fPIC"
+            "CFLAGS=${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${breakpad_build_type}} -fPIC"
             "CXX=${CMAKE_CXX_COMPILER}"
-            "CXXFLAGS=${CMAKE_CXX_FLAGS} -fPIC -Wno-error"
+            "CXXFLAGS=${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${breakpad_build_type}} -fPIC -Wno-error"
     BUILD_COMMAND ${make_cmd}
     # Install this library to ensure headers are included with proper prefixed paths
     # (e.g., "breakpad/client/linux/handler/minidump_descriptor.h") rather than

@@ -878,7 +878,11 @@ static int rgw_iam_add_objtags(const DoutPrefixProvider *dpp, req_state* s, rgw:
 
 static int rgw_iam_add_objtags(const DoutPrefixProvider *dpp, req_state* s, bool has_existing_obj_tag, bool has_resource_tag) {
   if (!rgw::sal::Object::empty(s->object.get())) {
-    return rgw_iam_add_objtags(dpp, s, s->object.get(), has_existing_obj_tag, has_resource_tag);
+    // read the tags through a separate handle. get_obj_attrs() sets the
+    // resolved version as the object's instance, and s->object has to keep
+    // the instance from the request
+    auto obj = s->object->get_bucket()->get_object(s->object->get_key());
+    return rgw_iam_add_objtags(dpp, s, obj.get(), has_existing_obj_tag, has_resource_tag);
   }
   return 0;
 }

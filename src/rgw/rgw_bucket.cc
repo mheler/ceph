@@ -177,6 +177,15 @@ int rgw_chown_bucket_and_objects(rgw::sal::Driver* driver, rgw::sal::Bucket* buc
     count += results.objs.size();
 
     for (const auto& obj : results.objs) {
+      if (obj.is_delete_marker()) {
+        continue; // delete markers have no object to chown
+      }
+      if (obj.key.instance.empty() && !obj.is_current()) {
+        // a noncurrent null version is listed with an empty instance, which
+        // resolves to the current version instead, or to ENOENT when that's
+        // a delete marker. skip it rather than chown the wrong version
+        continue;
+      }
       std::unique_ptr<rgw::sal::Object> r_obj = bucket->get_object(obj.key);
 
       ret = r_obj->chown(dpp, new_owner, new_owner_name, y);

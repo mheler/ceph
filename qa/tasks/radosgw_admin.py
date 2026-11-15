@@ -964,6 +964,14 @@ def task(ctx, config):
     object_name1 = 'thirteen'
     connection3.put_object(Bucket=bucket_name6, Key=object_name1, Body=object_name1)
 
+    # version the bucket, and leave a delete marker on top of a null version
+    object_name3 = 'deleted'
+    connection3.put_object(Bucket=bucket_name6, Key=object_name3, Body=object_name3)
+    connection3.put_bucket_versioning(Bucket=bucket_name6, VersioningConfiguration={'Status': 'Enabled'})
+    version_ids = [connection3.put_object(Bucket=bucket_name6, Key=object_name1, Body=object_name1)['VersionId']
+                   for _ in range(2)]
+    connection3.delete_object(Bucket=bucket_name6, Key=object_name3)
+
     # rename user3
     (err, out) = rgwadmin(ctx, client, ['user', 'rename', '--uid', user3, '--new-uid', user4], check_status=True)
     assert out['user_id'] == user4
@@ -975,6 +983,10 @@ def task(ctx, config):
     # get bucket and object to test if user keys are preserved
     s = connection3.get_object(Bucket=bucket_name6, Key=object_name1)['Body'].read().decode()
     assert s == object_name1
+
+    # the rename changed the owner of every named version, not just the current ones
+    for version_id in version_ids:
+        connection3.get_object(Bucket=bucket_name6, Key=object_name1, VersionId=version_id)
 
     # TESTCASE 'user-rename', 'user', 'rename', 'existing user', 'another existing user', 'fails'
     # create a new user user2
